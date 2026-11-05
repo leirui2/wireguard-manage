@@ -16,6 +16,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from .backend import make_backend
+from .downloads import CLIENTS, OFFICIAL_INSTALL_PAGE, open_url
 from .probe import ProbeError, probe
 from .service import WGService
 from .util import (
@@ -259,6 +260,8 @@ class App:
                    command=self._advanced_dialog).pack(side="left", padx=(10, 0))
         ttk.Button(row3, text="使用帮助", width=12,
                    command=self._help_dialog).pack(side="left", padx=6)
+        ttk.Button(row3, text="下载客户端", width=12,
+                   command=self._downloads_dialog).pack(side="left")
         self.status_label = ttk.Label(row3, textvariable=self.status_var,
                                       foreground="#b03030")
         self.status_label.pack(side="right")
@@ -693,6 +696,9 @@ class App:
     def _help_dialog(self) -> None:
         messagebox.showinfo("使用帮助", HELP_TEXT, parent=self.root)
 
+    def _downloads_dialog(self) -> None:
+        DownloadDialog(self.root)
+
     def _on_auth_change(self) -> None:
         if self.demo_var.get():
             return
@@ -953,6 +959,11 @@ class ClientConfDialog:
             ttk.Label(frame, text=f"已自动保存到：{saved_path}",
                       foreground="#0a7a3d").pack(anchor="w")
 
+        link = ttk.Label(frame, text="还没装 WireGuard 客户端？点这里下载（安卓 / iOS / Windows）",
+                         foreground="#0a5bd3", cursor="hand2")
+        link.pack(anchor="w", pady=(6, 0))
+        link.bind("<Button-1>", lambda _e: DownloadDialog(top))
+
         bar = ttk.Frame(frame)
         bar.pack(fill="x", pady=(8, 0))
 
@@ -1049,6 +1060,58 @@ class QrDialog:
         show_dialog(top, parent)
 
 
+class DownloadDialog:
+    """官方 WireGuard 客户端下载入口（Windows / Android / iOS / macOS / Linux）。"""
+
+    def __init__(self, parent):
+        self.top = top = tk.Toplevel(parent)
+        top.withdraw()
+        top.title("下载 WireGuard 客户端")
+        top.resizable(False, False)
+        frame = ttk.Frame(top, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="密钥配置有了，客户端还没装的话从这里下（均为官方地址）：",
+                  font=(CN_FONT, 10, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        for i, item in enumerate(CLIENTS, start=1):
+            ttk.Label(frame, text=item["platform"], width=13, anchor="w",
+                      font=(CN_FONT, 10, "bold")).grid(row=i, column=0, sticky="w", pady=5)
+            ttk.Label(frame, text=item["hint"], wraplength=380, justify="left",
+                      foreground="#555555").grid(row=i, column=1, sticky="w", padx=(8, 14))
+            ttk.Button(frame, text=item["action"], width=8,
+                       command=lambda u=item["url"]: self._open(u)).grid(
+                row=i, column=2, sticky="e")
+
+        last = len(CLIENTS) + 1
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=last, column=0, columnspan=3, sticky="ew", pady=(14, 10))
+        ttk.Label(
+            frame,
+            text="注意：中国区 App Store 搜不到 WireGuard（链接只会跳到 App Store 首页），"
+                 "需要非中国区 Apple ID；Google Play 在国内也打不开，"
+                 "安卓可以在官方安装页下载 APK。\n"
+                 "版本和链接一直在变，拿不准就以官方安装页为准。",
+            foreground="#a05000", justify="left", wraplength=580,
+        ).grid(row=last + 1, column=0, columnspan=3, sticky="w")
+
+        bar = ttk.Frame(frame)
+        bar.grid(row=last + 2, column=0, columnspan=3, sticky="ew", pady=(14, 0))
+        ttk.Button(bar, text="打开官方安装页", width=16,
+                   command=lambda: self._open(OFFICIAL_INSTALL_PAGE)).pack(side="left")
+        ttk.Button(bar, text="关闭", width=12, command=top.destroy).pack(side="right")
+        show_dialog(top, parent)
+
+    def _open(self, url: str) -> None:
+        if not open_url(url):
+            messagebox.showwarning(
+                "打不开浏览器",
+                "没能自动打开浏览器，请手动复制这个地址：\n\n" + url,
+                parent=self.top,
+            )
+
+
 class DetailDialog:
     def __init__(self, parent, view):
         top = tk.Toplevel(parent)
@@ -1130,6 +1193,16 @@ HELP_TEXT = """WireGuard 密钥管理工具 · 使用说明
 自动挑一个网段里没被占用的 IPv4 / IPv6 地址，生成密钥对，往 wg0.conf 追加 [Peer]，
 然后用 wg syncconf 热加载（不会踢掉现有连接）。生成的客户端 .conf 会弹窗展示，
 并默认保存到 clients/ 目录，可直接导入 WireGuard 客户端。
+那个窗口还能「生成二维码」，手机 App 扫码直接导入。
+
+【修改密钥】
+选中一行点「编辑选中」，可以改名称、备注和 VPN 地址。
+改名称/备注只写注释，对已连接的隧道没有影响；改 VPN 地址会让该客户端断线，
+必须同步修改客户端配置里的 Address。公钥和预共享密钥不可修改。
+
+【下载客户端】
+顶部「下载客户端」按钮里有 Windows / Android / iOS / macOS / Linux 的官方下载地址，
+只收官方来源。注意：中国区 App Store 搜不到 WireGuard，Android 的 Google Play 在国内也打不开。
 
 【删除密钥】
 选中一行或多行（Ctrl / Shift 多选），点「删除选中」，二次确认后从配置和运行时一起移除。

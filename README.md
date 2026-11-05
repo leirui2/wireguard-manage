@@ -26,6 +26,7 @@ SHA256 校验值见同一发行版下的 [SHA256.txt](https://github.com/leirui2
 | **查看密钥** | 自动列出所有 `[Peer]`，显示备注名、公钥、VPN 地址、最近握手、上下行流量、来源端点、在线状态 |
 | **新增密钥** | 自动分配空闲 IPv4/IPv6 地址 → 生成密钥对 → 写入 `[Peer]` → 热加载 → 生成客户端 `.conf` |
 | **扫码导入** | 生成密钥后一键出二维码，手机 WireGuard App 直接扫，也可存成 PNG |
+| **客户端下载** | 内置 Windows / Android / iOS / macOS / Linux 官方下载入口，只收官方来源 |
 | **修改密钥** | 改名称 / 备注 / VPN 地址。改名只动注释、不影响隧道；改地址后自动检查冲突并提示同步客户端 |
 | **删除密钥** | 多选后二次确认，同时从配置和运行时移除 |
 | **备注管理** | 名称/备注以注释形式存在 `[Peer]` 上方，换设备、换工具都不会丢 |
@@ -158,6 +159,20 @@ python -m venv .build-venv
 - 接口名（如 `wg0`）
 - 客户端 Endpoint 主机（当 SSH 地址与 VPN 入口地址不同时）
 
+### 7. 下载客户端
+
+顶部「下载客户端」按钮里放了各平台的**官方**下载地址（只收官方来源）：
+
+| 平台 | 地址 | 备注 |
+|---|---|---|
+| Windows | [wireguard-installer.exe](https://download.wireguard.com/windows-client/wireguard-installer.exe) | 自动选 64/ARM 架构，装完双击 `.conf` 即可导入 |
+| Android | [Google Play](https://play.google.com/store/apps/details?id=com.wireguard.android) | 国内打不开的话，到[官方安装页](https://www.wireguard.com/install/)下 APK |
+| iOS / iPadOS | [App Store](https://apps.apple.com/app/wireguard/id1441195209) | **中国区 App Store 搜不到**，需要非中国区 Apple ID |
+| macOS | [App Store](https://apps.apple.com/app/wireguard/id1451685025) | 需要 macOS 12 或更高 |
+| Linux | [官方安装页](https://www.wireguard.com/install/) | `apt` / `dnf` / `pacman` 直接装 |
+
+> 生成密钥后的「客户端配置」窗口里也有同样的入口——配置到手，下一步就是装客户端。
+
 ---
 
 ## 安全设计
@@ -216,9 +231,10 @@ wireguard-manage/
 │   ├── backend.py             # SSH / Docker / 演示服务器三种后端
 │   ├── probe.py               # 部署方式自动探测 + 错误诊断
 │   ├── config.py              # wg0.conf 保真解析与改写
-│   ├── service.py             # 增删查、备份/热加载/回滚
-│   └── util.py                # 密钥生成、IP 分配、二维码、格式化
-├── tests/test_core.py         # 34 个单元测试（含模拟服务器）
+│   ├── service.py             # 增删改查、备份/热加载/回滚
+│   ├── util.py                # 密钥生成、IP 分配、二维码、格式化
+│   └── downloads.py           # 官方客户端下载地址
+├── tests/test_core.py         # 37 个单元测试（含模拟服务器）
 ├── build_assets/              # 图标、版本信息、界面截图
 ├── wireguard-manager.spec     # PyInstaller 打包配置
 ├── requirements.txt           # 运行时依赖
@@ -291,7 +307,7 @@ PyInstaller 打包的程序没有代码签名，容易被误报。添加信任�
 python -m unittest discover -s tests -v
 ```
 
-测试使用内存模拟服务器（`DemoBackend`），不依赖真实环境，覆盖：配置保真解析、部署探测、增删改密钥、地址冲突与非法地址拒绝、改注释不影响其它行、重名拒绝、手动指定 IP、二维码 PNG 与定位角完整性、热加载失败自动回滚、sudo 命令构造、窗口居中。
+测试使用内存模拟服务器（`DemoBackend`），不依赖真实环境，覆盖：配置保真解析、部署探测、增删改密钥、地址冲突与非法地址拒绝、改注释不影响其它行、重名拒绝、手动指定 IP、二维码 PNG 与定位角完整性、二维码图片不被回收、下载链接只收官方域名、热加载失败自动回滚、sudo 命令构造、窗口居中。
 
 界面里勾选「演示模式」也能不接服务器直接试用全部流程。
 

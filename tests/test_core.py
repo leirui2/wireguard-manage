@@ -488,6 +488,45 @@ class TestSSHBackend(unittest.TestCase):
         self.assertIn("sudo 密码", res.err)
 
 
+class TestClientDownloads(unittest.TestCase):
+    """下载链接只收官方来源，写错域名等于把人导到钓鱼站。"""
+
+    def test_links_are_official(self):
+        from wgmanager.downloads import CLIENTS, OFFICIAL_INSTALL_PAGE
+
+        allowed = (
+            "https://download.wireguard.com/",
+            "https://play.google.com/store/apps/details?id=com.wireguard.android",
+            "https://apps.apple.com/",
+            "https://www.wireguard.com/",
+        )
+        self.assertTrue(OFFICIAL_INSTALL_PAGE.startswith("https://www.wireguard.com/"))
+        self.assertGreaterEqual(len(CLIENTS), 4)
+        platforms = [c["platform"] for c in CLIENTS]
+        for name in ("Windows", "Android", "iOS / iPadOS"):
+            self.assertIn(name, platforms)
+        for item in CLIENTS:
+            with self.subTest(platform=item["platform"]):
+                self.assertTrue(item["url"].startswith("https://"), item["url"])
+                self.assertTrue(item["url"].startswith(allowed), item["url"])
+                self.assertTrue(item["hint"].strip())
+                self.assertIn(item["action"], ("下载", "打开"))
+
+    def test_windows_installer_and_package_ids(self):
+        from wgmanager.downloads import CLIENTS
+
+        by_platform = {c["platform"]: c["url"] for c in CLIENTS}
+        self.assertTrue(
+            by_platform["Windows"].endswith("/wireguard-installer.exe"),
+            by_platform["Windows"],
+        )
+        self.assertIn("com.wireguard.android", by_platform["Android"])
+        self.assertIn("id1441195209", by_platform["iOS / iPadOS"])
+        # macOS 的 App Store id 和 iOS 不是同一个，别抄错
+        self.assertIn("id1451685025", by_platform.get("macOS", ""))
+        self.assertNotEqual(by_platform["macOS"], by_platform["iOS / iPadOS"])
+
+
 class TestQrDialog(unittest.TestCase):
     def test_image_survives_garbage_collection(self):
         """真实路径下没人持有 QrDialog 实例，图片引用必须挂在窗口上，否则界面留白。"""
