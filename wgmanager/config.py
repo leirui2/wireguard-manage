@@ -181,6 +181,75 @@ class WGConfig:
             body.pop()
         self.lines = body + [""] + lines + [""]
 
+    def update_peer(
+        self,
+        peer: Peer,
+        *,
+        name: str | None = None,
+        note: str | None = None,
+        allowed_ips: str | None = None,
+    ) -> None:
+        """就地修改一个已存在 Peer 的名称 / 备注 / AllowedIPs。
+
+        只动目标行：名称和备注写成 `# WGM_*` 注释挂在 [Peer] 上方，
+        AllowedIPs 只替换 Key 值相同的行；其余字段与注释逐字保留。
+        """
+        if peer.header_index < 0 or peer.block_end > len(self.lines):
+            raise ValueError("该 Peer 的段落位置已失效，请刷新后重试")
+
+        if allowed_ips is not None:
+            self._set_peer_field(peer, "AllowedIPs", allowed_ips)
+
+        if name is not None or note is not None:
+            current = {}
+            for line in self.lines[peer.block_start : peer.header_index]:
+                m = META_RE.match(line.strip())
+                if m:
+                    current[m.group(1).lower()] = m.group(2).strip()
+            final_name = name if name is not None else (
+                current.get("name") or peer.raw_name or ""
+            )
+            final_note = note if note is not None else current.get("note", peer.note)
+            self._set_meta(peer, final_name, final_note, current.get("created", peer.created))
+
+    def _set_peer_field(self, peer: Peer, key: str, value: str) -> None:
+        lower = key.lower()
+        anchor = None
+        for i in range(peer.header_index + 1, peer.block_end):
+            m = KV_RE.match(self.lines[i])
+            if not m:
+                continue
+            if m.group(1).lower() == lower:
+                self.lines[i] = f"{key} = {value}"
+                return
+            if m.group(1).lower() == "publickey" and anchor is None:
+                anchor = i
+        at = (anchor + 1) if anchor is not None else (peer.header_index + 1)
+        self.lines.insert(at, f"{key} = {value}")
+        peer.block_end += 1
+
+    def _set_meta(self, peer: Peer, name: str, note: str, created: str) -> None:
+        """重建 [Peer] 上方的 WGM 注释块，保留其它注释（如一键脚本的 ### Client xxx）。"""
+        start, header = peer.block_start, peer.header_index
+        block = self.lines[start:header]
+        kept = [line for line in block if not META_RE.match(line.strip())]
+        while kept and kept[-1].strip() == "":
+            kept.pop()
+        if not kept and block and block[0].strip() == "":
+            kept = [""]  # 保留与上一段之间的空行
+
+        new_block = kept + [
+            f"# WGM_NAME: {name or ''}",
+            f"# WGM_NOTE: {note or ''}",
+        ]
+        if created:
+            new_block.append(f"# WGM_CREATED: {created}")
+
+        delta = len(new_block) - len(block)
+        self.lines[start:header] = new_block
+        peer.header_index += delta
+        peer.block_end += delta
+
     def remove_peer(self, peer: Peer) -> None:
         if peer.block_start < 0 or peer.block_end > len(self.lines):
             raise ValueError("该 Peer 的段落位置已失效，请刷新后重试")

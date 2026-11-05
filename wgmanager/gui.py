@@ -1,6 +1,6 @@
 """Windows 桌面界面（tkinter / ttk）。
 
-界面分四块：连接服务器 -> 探测结果 -> 密钥列表与增删 -> 操作日志。
+界面分四块：连接服务器 -> 探测结果 -> 密钥列表与增删改 -> 操作日志。
 所有 SSH 操作都放在后台线程，界面不会卡死；线程只通过队列把日志和结果送回主线程。
 """
 from __future__ import annotations
@@ -17,7 +17,12 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from .backend import make_backend
 from .probe import ProbeError, probe
 from .service import WGService
-from .util import safe_filename, stamp
+from .util import (
+    normalize_allowed_ips,
+    patch_client_conf,
+    safe_filename,
+    stamp,
+)
 
 
 def app_dir() -> str:
@@ -277,6 +282,9 @@ class App:
         self.delete_btn = ttk.Button(bar, text="删除选中", width=12,
                                      command=self.delete_selected, state="disabled")
         self.delete_btn.pack(side="right", padx=4)
+        self.edit_btn = ttk.Button(bar, text="编辑选中", width=12,
+                                   command=self.edit_selected, state="disabled")
+        self.edit_btn.pack(side="right", padx=4)
         self.add_btn = ttk.Button(bar, text="＋ 新增密钥", width=14,
                                   style="Accent.TButton", command=self.add_dialog,
                                   state="disabled")
@@ -376,7 +384,7 @@ class App:
     def _set_buttons(self) -> None:
         connected = self.service is not None
         enabled = connected and not self.busy
-        for btn in (self.refresh_btn, self.add_btn, self.delete_btn):
+        for btn in (self.refresh_btn, self.add_btn, self.edit_btn, self.delete_btn):
             btn.configure(state="normal" if enabled else "disabled")
         self.connect_btn.configure(state="normal" if (not self.busy and not connected) else "disabled")
         self.disconnect_btn.configure(state="normal" if (connected and not self.busy) else "disabled")
@@ -552,6 +560,99 @@ class App:
             self.refresh()
 
         self._async("删除密钥", work, done)
+
+    # ---------------------------------------------------------------- 编辑
+    def edit_selected(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("未选择", "请先在列表里选中要修改的密钥", parent=self.root)
+            return
+        if len(selected) > 1:
+            messagebox.showinfo("只能改一个", "一次只能编辑一个密钥，请只选中一行",
+                                parent=self.root)
+            return
+        key = self.row_keys.get(selected[0])
+        view = next((v for v in self.views if v.pubkey == key), None)
+        if not view:
+            return
+
+        dlg = EditDialog(self.root, view)
+        self.root.wait_window(dlg.top)
+        if not dlg.result:
+            return
+        params = dlg.result
+
+        def work():
+            return self.service.update_peer(view.pubkey, **params)
+
+        def done(res):
+            if not res.changed:
+                self._append_log(f"「{view.name}」没有变化")
+                return
+            self._append_log(f"已修改「{res.name}」：{'、'.join(res.changed)}")
+            if res.backup:
+                self._append_log(f"服务器备份：{res.backup}")
+            if res.reload_msg:
+                self._append_log(res.reload_msg)
+            for note in res.warnings:
+                self._append_log("注意：" + note)
+            if res.address_changed:
+                self._after_address_change(view, res)
+            self.refresh()
+
+        self._async("保存修改", work, done)
+
+    def _after_address_change(self, view, res) -> None:
+        """地址变了：提示客户端必须同步改，本地若有对应 .conf 就顺便改掉。"""
+        new_addr = ", ".join(res.addresses) or res.new_allowed_ips
+        lines = [
+            f"「{res.name}」的 VPN 地址已改为：{new_addr}",
+            f"（原来是 {res.old_allowed_ips}）",
+            "",
+            "这个客户端会立刻断线。需要在它的配置文件里把 Address 改成同样的值，",
+            "保存后重新连接才能恢复。",
+        ]
+        for note in res.warnings:
+            if "VPN 网段" in note:
+                lines += ["", "⚠ " + note]
+
+        candidates = []
+        for label in {view.name, res.name}:
+            path = os.path.join(CLIENTS_DIR, f"{safe_filename(label)}.conf")
+            if os.path.isfile(path) and path not in candidates:
+                candidates.append(path)
+
+        if candidates:
+            local = candidates[0]
+            lines += ["", f"发现本机有它导出的配置：{local}"]
+            if messagebox.askyesno(
+                "地址已修改", "\n".join(lines) + "\n\n要顺便把该文件的 Address 行改掉吗？",
+                icon="question", parent=self.root,
+            ):
+                try:
+                    with open(local, encoding="utf-8") as f:
+                        text = f.read()
+                    patched = patch_client_conf(text, res.addresses)
+                    with open(local, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(patched)
+                    self._append_log(f"已同步修改本地配置：{local}")
+                except Exception as exc:
+                    self._append_log(f"修改本地配置失败：{exc}")
+                    messagebox.showwarning(
+                        "本地配置没改成",
+                        f"{exc}\n\n请手工把 {local} 里的 Address 改成 {new_addr}",
+                        parent=self.root,
+                    )
+            else:
+                self._append_log(f"未修改本地配置 {local}，记得手工把 Address 改成 {new_addr}")
+            return
+
+        messagebox.showinfo(
+            "地址已修改",
+            "\n".join(lines) + "\n\n本机没有找到该客户端的 .conf（配置可能在别的设备上），"
+            "请直接在那个设备上改。",
+            parent=self.root,
+        )
 
     # ---------------------------------------------------------------- 其它
     def _show_selected_detail(self) -> None:
@@ -734,6 +835,94 @@ class AddDialog:
             "vpn_addresses": self.vpn_addresses.get().strip(),
         }
         self.result = (params, self.save_file.get())
+        self.top.destroy()
+
+
+class EditDialog:
+    """修改已有密钥：名称 / 备注 / VPN 地址。
+
+    公钥和预共享密钥不允许改——前者是身份，后者改了等于重发密钥，
+    真要换只能删掉重建。
+    """
+
+    def __init__(self, parent, view):
+        self.result = None
+        self.view = view
+        self.top = top = tk.Toplevel(parent)
+        top.withdraw()
+        top.title("编辑密钥")
+        top.resizable(False, False)
+
+        frame = ttk.Frame(top, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        self.name = tk.StringVar(value=view.raw_name)
+        self.note = tk.StringVar(value=view.note)
+        self.addr = tk.StringVar(value=view.allowed_ips)
+
+        rows = [
+            ("名称 *：", self.name, "只影响显示，不动密钥本身"),
+            ("备注：", self.note, "选填，例如 研发部 / 张三的手机"),
+            ("VPN 地址：", self.addr, "多个用逗号分隔，如 10.8.0.9/32, fd08::9/128"),
+        ]
+        for i, (label, var, hint) in enumerate(rows):
+            ttk.Label(frame, text=label, width=13, anchor="e").grid(
+                row=i, column=0, sticky="e", pady=4
+            )
+            ttk.Entry(frame, textvariable=var, width=46).grid(
+                row=i, column=1, sticky="w", pady=2
+            )
+            ttk.Label(frame, text=hint, foreground="#777777").grid(
+                row=i, column=2, sticky="w", padx=(10, 0)
+            )
+
+        key_row = ttk.Frame(frame)
+        key_row.grid(row=len(rows), column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(key_row, text="公钥：", width=13, anchor="e").pack(side="left")
+        ttk.Label(key_row, text=view.pubkey, font=("Consolas", 9)).pack(side="left")
+        ttk.Label(key_row, text="（不可修改）", foreground="#777777").pack(side="left", padx=(6, 0))
+
+        ttk.Label(
+            frame,
+            text="改名称、备注只动配置文件里的注释，对已连接的隧道没有影响；\n"
+                 "改 VPN 地址会让该客户端立即断线，必须同步修改客户端配置里的 Address。",
+            foreground="#a05000", wraplength=620, justify="left",
+        ).grid(row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=len(rows) + 2, column=0, columnspan=3, pady=(16, 0))
+        ttk.Button(buttons, text="保存修改", width=14, style="Accent.TButton",
+                   command=self._ok).pack(side="right", padx=4)
+        ttk.Button(buttons, text="取消", width=10, command=top.destroy).pack(side="right", padx=4)
+        top.bind("<Return>", lambda _e: self._ok())
+        top.bind("<Escape>", lambda _e: top.destroy())
+        show_dialog(top, parent, modal=True)
+
+    def _ok(self) -> None:
+        name = self.name.get().strip()
+        if not name:
+            messagebox.showwarning("缺少名称", "请填写密钥名称", parent=self.top)
+            return
+        try:
+            addr = normalize_allowed_ips(self.addr.get())
+        except ValueError as exc:
+            messagebox.showwarning("地址格式不对", str(exc), parent=self.top)
+            return
+
+        self.addr.set(addr)
+        if (
+            name == (self.view.raw_name or "")
+            and self.note.get().strip() == (self.view.note or "")
+            and addr == (self.view.allowed_ips or "")
+        ):
+            self.top.destroy()  # 一个字都没改，直接关掉
+            return
+
+        self.result = {
+            "name": name,
+            "note": self.note.get().strip(),
+            "allowed_ips": addr,
+        }
         self.top.destroy()
 
 

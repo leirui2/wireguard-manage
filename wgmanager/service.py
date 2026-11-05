@@ -1,4 +1,4 @@
-"""业务逻辑：查看 / 新增 / 删除密钥。
+"""业务逻辑：查看 / 新增 / 修改 / 删除密钥。
 
 写配置的固定流程（每一步都可回退）：
     备份 wg0.conf -> 写临时文件 -> 原子替换 -> wg syncconf 热加载 -> 校验生效
@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import ipaddress
 import secrets
 import shlex
 import time
@@ -19,8 +20,11 @@ from .util import (
     allocate_addresses,
     gen_keypair,
     gen_psk,
+    host_addresses,
     human_bytes,
     human_handshake,
+    normalize_allowed_ips,
+    split_networks,
     stamp,
 )
 
@@ -50,6 +54,7 @@ def _table(out: str) -> dict[str, list[str]]:
 class PeerView:
     pubkey: str = ""
     name: str = ""
+    raw_name: str = ""
     note: str = ""
     created: str = ""
     allowed_ips: str = ""
@@ -78,6 +83,23 @@ class ApplyResult:
     reload_msg: str = ""
     runtime_verified: bool = False
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class UpdateResult:
+    name: str = ""
+    public_key: str = ""
+    changed: list[str] = field(default_factory=list)
+    addresses: list[str] = field(default_factory=list)
+    old_allowed_ips: str = ""
+    new_allowed_ips: str = ""
+    backup: str = ""
+    reload_msg: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def address_changed(self) -> bool:
+        return "VPN 地址" in self.changed
 
 
 def build_client_conf(
@@ -155,6 +177,7 @@ class WGService:
                 PeerView(
                     pubkey=peer.public_key,
                     name=peer.display_name,
+                    raw_name=peer.raw_name,
                     note=peer.note,
                     created=peer.created,
                     allowed_ips=peer.allowed_ips,
@@ -232,6 +255,134 @@ class WGService:
             backup=applied.backup,
             reload_msg=applied.reload_msg,
         )
+
+    # ------------------------------------------------------------------ 修改
+    def update_peer(
+        self,
+        pubkey: str,
+        *,
+        name: str | None = None,
+        note: str | None = None,
+        allowed_ips: str | None = None,
+    ) -> UpdateResult:
+        """修改已有密钥的名称 / 备注 / VPN 地址。
+
+        传 None 表示该项不动。改名称和备注只动注释，对运行中的隧道没有任何影响；
+        改 VPN 地址会变更服务端分配，客户端必须同步改 Address 后才能重连。
+        """
+        conf = self.refresh_conf()
+        peers = conf.peers()
+        peer = next((p for p in peers if p.public_key == pubkey), None)
+        if peer is None:
+            raise ValueError("该密钥在服务器上已不存在，请刷新后重试")
+
+        changed: list[str] = []
+        warnings: list[str] = []
+
+        new_name = None
+        if name is not None:
+            new_name = (name or "").strip()
+            if not new_name:
+                raise ValueError("密钥名称不能为空")
+            if new_name != (peer.raw_name or ""):
+                if any(p.public_key != pubkey and p.raw_name == new_name for p in peers):
+                    raise ValueError(f"已存在同名密钥「{new_name}」，请换一个名称")
+                changed.append("名称")
+
+        new_note = None
+        if note is not None:
+            new_note = (note or "").strip()
+            if new_note != (peer.note or ""):
+                changed.append("备注")
+
+        new_allowed = None
+        if allowed_ips is not None:
+            new_allowed = normalize_allowed_ips(allowed_ips)
+            if new_allowed != peer.allowed_ips:
+                self._check_address_available(peers, pubkey, new_allowed)
+                changed.append("VPN 地址")
+
+        final_name = new_name if new_name is not None else (peer.raw_name or "")
+        result = UpdateResult(
+            name=final_name or f"未命名 ({pubkey[:8]})",
+            public_key=pubkey,
+            changed=list(changed),
+            old_allowed_ips=peer.allowed_ips,
+            new_allowed_ips=new_allowed if new_allowed is not None else peer.allowed_ips,
+        )
+        result.addresses = host_addresses(result.new_allowed_ips)
+
+        if not changed:
+            self.log(f"「{result.name}」没有需要修改的内容")
+            return result
+
+        if "VPN 地址" in changed:
+            if not self._in_vpn_subnet(result.new_allowed_ips):
+                warnings.append(
+                    f"新地址不在 VPN 网段（{', '.join(self.dep.addresses) or '未识别'}）内，"
+                    "客户端很可能连不通"
+                )
+            warnings.append(
+                "该客户端会立即断线，需要在它的配置里把 Address 改成 "
+                + (", ".join(result.addresses) or result.new_allowed_ips)
+                + " 后重新连接"
+            )
+
+        conf.update_peer(peer, name=new_name, note=new_note, allowed_ips=new_allowed)
+        applied = self._apply(conf.render(), expect_present={pubkey}, expect_absent=set())
+        result.backup = applied.backup
+        result.reload_msg = applied.reload_msg
+        result.warnings = warnings + list(applied.warnings)
+        self.log(f"已修改「{result.name}」：{'、'.join(changed)}")
+        return result
+
+    def _check_address_available(self, peers, pubkey: str, allowed_ips: str) -> None:
+        """同一地址不能分给两个 peer，也不能占用服务器自己的地址。"""
+        owner: dict[str, str] = {}
+        for other in peers:
+            if other.public_key == pubkey:
+                continue
+            for net in split_networks(other.allowed_ips):
+                owner[net] = other.display_name
+        server: set[str] = set()
+        for group in self.dep.addresses:
+            for token in str(group).split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    server.add(str(ipaddress.ip_interface(token).ip))
+                except ValueError:
+                    continue
+        for net in split_networks(allowed_ips):
+            if net in owner:
+                raise ValueError(f"地址 {net} 已被「{owner[net]}」占用，请换一个")
+            host = net.split("/")[0]
+            if host in server:
+                raise ValueError(f"{host} 是服务器自己的地址，不能分配给客户端")
+
+    def _in_vpn_subnet(self, allowed_ips: str) -> bool:
+        nets = []
+        for group in self.dep.addresses:
+            for token in str(group).split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    nets.append(ipaddress.ip_interface(token).network)
+                except ValueError:
+                    continue
+        if not nets:
+            return True  # 探测不到网段就别拦，交给用户自己判断
+        for net in split_networks(allowed_ips):
+            try:
+                candidate = ipaddress.ip_network(net, strict=False).network_address
+            except ValueError:
+                continue
+            for n in nets:
+                if n.version == candidate.version and candidate in n:
+                    return True
+        return False
 
     # ------------------------------------------------------------------ 删除
     def remove_peers(self, pubkeys: set[str]) -> list[str]:

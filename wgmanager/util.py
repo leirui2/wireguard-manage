@@ -131,6 +131,85 @@ def allocate_addresses(iface_addresses: Iterable[str], used_allowed_ips: Iterabl
     return result
 
 
+def normalize_allowed_ips(text: str) -> str:
+    """把用户输入的地址/网段规范成 `10.8.0.9/32, fd08::9/128` 这种形式。
+
+    只写裸 IP 时自动补 /32 或 /128；拒绝 /0 这类过大的网段——服务端给单个客户端
+    分配的应该是具体地址，写 0.0.0.0/0 会把所有流量都判给这一个 peer。
+    """
+    tokens = [t for t in re.split(r"[,\s]+", (text or "").strip()) if t]
+    if not tokens:
+        raise ValueError("VPN 地址不能为空")
+    result: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        try:
+            if "/" in token:
+                net = ipaddress.ip_network(token, strict=False)
+            else:
+                ip = ipaddress.ip_address(token)
+                net = ipaddress.ip_network(f"{ip}/{ip.max_prefixlen}", strict=False)
+        except ValueError:
+            raise ValueError(f"「{token}」不是合法的 IP 或网段")
+        if net.prefixlen == 0:
+            raise ValueError(
+                f"「{token}」范围过大：这里要填分配给该客户端的具体地址，例如 10.8.0.9/32"
+            )
+        key = str(net)
+        if key not in seen:
+            seen.add(key)
+            result.append(key)
+    return ", ".join(result)
+
+
+def split_networks(text: str) -> list[str]:
+    """把 AllowedIPs 拆成规范化的网段列表，解析不了的原样保留。"""
+    out: list[str] = []
+    for token in str(text or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.append(str(ipaddress.ip_network(token, strict=False)))
+        except ValueError:
+            out.append(token)
+    return out
+
+
+def host_addresses(text: str) -> list[str]:
+    """从 AllowedIPs 里挑出主机地址（/32、/128），即客户端 Address 该写的值。"""
+    out: list[str] = []
+    for token in split_networks(text):
+        try:
+            net = ipaddress.ip_network(token, strict=False)
+        except ValueError:
+            continue
+        if net.prefixlen == net.max_prefixlen:
+            out.append(str(net))
+    return out
+
+
+def patch_client_conf(text: str, addresses: list[str]) -> str:
+    """把客户端配置 [Interface] 段的 Address 改成新地址，其余行逐字保留。"""
+    new_line = f"Address = {', '.join(addresses)}"
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    in_interface = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_interface = stripped.strip("[]").strip().lower() == "interface"
+            continue
+        if in_interface and re.match(r"^address\s*=", stripped, re.IGNORECASE):
+            lines[i] = new_line
+            return "\n".join(lines)
+    # 没有 Address 行就补在 [Interface] 段头后面
+    for i, line in enumerate(lines):
+        if line.strip().lower() == "[interface]":
+            lines.insert(i + 1, new_line)
+            return "\n".join(lines)
+    raise ValueError("该配置文件里没有 [Interface] 段，无法自动修改")
+
+
 def short_key(key: str, n: int = 10) -> str:
     key = key or ""
     return key[:n] + ("…" if len(key) > n else "")

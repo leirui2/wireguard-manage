@@ -64,6 +64,48 @@ class TestConfig(unittest.TestCase):
         self.assertNotIn("PostUp", stripped)
         self.assertNotIn("WGM_NAME", stripped)
 
+    def test_update_peer_keeps_other_lines(self):
+        conf = WGConfig(DemoBackend().fs[CONF_PATH])
+        peer = conf.peers()[2]
+        conf.update_peer(peer, name="改名了", note="新备注", allowed_ips="10.8.0.44/32")
+        out = conf.render()
+        self.assertIn("# WGM_NAME: 改名了", out)
+        self.assertIn("# WGM_NOTE: 新备注", out)
+        self.assertIn("AllowedIPs = 10.8.0.44/32", out)
+        self.assertIn("PostUp = iptables -A FORWARD -i %i -j ACCEPT", out)
+        self.assertIn("# 上面这些行在工具改写配置时会原样保留", out)
+
+        again = WGConfig(out)
+        self.assertEqual(len(again.peers()), 3)
+        self.assertEqual(again.peers()[0].raw_name, "zhangsan-laptop")
+        self.assertEqual(again.peers()[2].raw_name, "改名了")
+        self.assertEqual(again.peers()[2].note, "新备注")
+        self.assertEqual(again.peers()[2].allowed_ips, "10.8.0.44/32")
+        # 公钥不能被改动
+        self.assertEqual(again.peers()[2].public_key, peer.public_key)
+
+    def test_update_peer_adds_meta_to_unnamed(self):
+        text = (
+            "[Interface]\nAddress = 10.8.0.1/24\n\n"
+            "[Peer]\nPublicKey = " + _demo_key("x") + "\nAllowedIPs = 10.8.0.9/32\n"
+        )
+        conf = WGConfig(text)
+        self.assertEqual(conf.peers()[0].raw_name, "")
+        conf.update_peer(conf.peers()[0], name="无名氏", note="补个备注")
+        out = conf.render()
+        self.assertIn("# WGM_NAME: 无名氏", out)
+        self.assertTrue(out.startswith("[Interface]\nAddress = 10.8.0.1/24\n"))
+        peer = WGConfig(out).peers()[0]
+        self.assertEqual((peer.raw_name, peer.note), ("无名氏", "补个备注"))
+        self.assertEqual(peer.allowed_ips, "10.8.0.9/32")
+
+    def test_update_peer_only_note_keeps_name(self):
+        conf = WGConfig(DemoBackend().fs[CONF_PATH])
+        conf.update_peer(conf.peers()[0], note="只改备注")
+        peer = WGConfig(conf.render()).peers()[0]
+        self.assertEqual(peer.raw_name, "zhangsan-laptop")
+        self.assertEqual(peer.note, "只改备注")
+
 
 class TestUtil(unittest.TestCase):
     def test_allocate_ipv4_ipv6(self):
@@ -72,6 +114,33 @@ class TestUtil(unittest.TestCase):
             ["10.8.0.2/32, fd08::2/128", "10.8.0.3/32, fd08::3/128"],
         )
         self.assertEqual(result, ["10.8.0.4/32", "fd08::4/128"])
+
+    def test_normalize_allowed_ips(self):
+        from wgmanager.util import normalize_allowed_ips
+
+        self.assertEqual(normalize_allowed_ips("10.8.0.9"), "10.8.0.9/32")
+        self.assertEqual(normalize_allowed_ips("fd08::9"), "fd08::9/128")
+        self.assertEqual(
+            normalize_allowed_ips(" 10.8.0.9 , fd08::9/128 "), "10.8.0.9/32, fd08::9/128"
+        )
+        self.assertEqual(normalize_allowed_ips("10.8.0.0/24"), "10.8.0.0/24")
+        for bad in ("", "abc", "10.8.0.1/33", "0.0.0.0/0", "::/0"):
+            with self.assertRaises(ValueError):
+                normalize_allowed_ips(bad)
+
+    def test_patch_client_conf(self):
+        from wgmanager.util import patch_client_conf
+
+        text = (
+            "# 注释保留\n[Interface]\nPrivateKey = abc\nAddress = 10.8.0.2/32\n"
+            "DNS = 1.1.1.1\n\n[Peer]\nPublicKey = xyz\nAllowedIPs = 0.0.0.0/0\n"
+        )
+        out = patch_client_conf(text, ["10.8.0.30/32"])
+        self.assertIn("Address = 10.8.0.30/32", out)
+        self.assertNotIn("Address = 10.8.0.2/32", out)
+        self.assertIn("PrivateKey = abc", out)
+        self.assertIn("DNS = 1.1.1.1", out)
+        self.assertIn("AllowedIPs = 0.0.0.0/0", out)  # 只改 Interface 里的 Address
 
     def test_local_pubkey(self):
         self.assertTrue(is_wg_key(pub_from_priv(_SERVER_PRIV)))
@@ -188,6 +257,88 @@ class TestService(unittest.TestCase):
                               use_psk=False)
         self.assertEqual(result.addresses, ["10.8.0.99/32", "fd08::99/128"])
         self.assertNotIn("PresharedKey", result.client_conf)
+
+    # ------------------------------------------------------------- 修改密钥
+    def test_update_peer_rename(self):
+        _backend, svc, _dep = build_service()
+        key = svc.list_peers()[2].pubkey
+        res = svc.update_peer(key, name="wangwu-ipad", note="行政部 / 王五")
+        self.assertEqual(res.changed, ["名称", "备注"])
+        self.assertEqual(res.name, "wangwu-ipad")
+        self.assertFalse(res.address_changed)
+        text = svc.target.fs[CONF_PATH]
+        self.assertIn("# WGM_NAME: wangwu-ipad", text)
+        self.assertIn("# WGM_NOTE: 行政部 / 王五", text)
+        self.assertIn("PostUp = iptables", text)
+        self.assertTrue(any(os.path.basename(k).startswith("wg0.conf.wgmgr.bak.") for k in svc.target.fs))
+        views = svc.list_peers()
+        self.assertIn("wangwu-ipad", [v.name for v in views])
+        self.assertEqual(views[2].note, "行政部 / 王五")
+
+    def test_update_peer_address(self):
+        _backend, svc, _dep = build_service()
+        key = svc.list_peers()[0].pubkey
+        res = svc.update_peer(key, allowed_ips="10.8.0.20/32, fd08::20/128")
+        self.assertTrue(res.address_changed)
+        self.assertEqual(res.changed, ["VPN 地址"])
+        self.assertEqual(res.addresses, ["10.8.0.20/32", "fd08::20/128"])
+        self.assertEqual(res.old_allowed_ips, "10.8.0.2/32, fd08::2/128")
+        self.assertTrue(any("Address" in w for w in res.warnings))
+        text = svc.target.fs[CONF_PATH]
+        self.assertIn("AllowedIPs = 10.8.0.20/32, fd08::20/128", text)
+        self.assertNotIn("10.8.0.2/32", text)
+        self.assertEqual(svc.list_peers()[0].address, "10.8.0.20, fd08::20")
+
+    def test_update_peer_bare_ip_filled_with_prefix(self):
+        _backend, svc, _dep = build_service()
+        key = svc.list_peers()[1].pubkey
+        res = svc.update_peer(key, allowed_ips="10.8.0.77")
+        self.assertEqual(res.new_allowed_ips, "10.8.0.77/32")
+        self.assertEqual(res.addresses, ["10.8.0.77/32"])
+
+    def test_update_peer_rejects_taken_address(self):
+        _backend, svc, _dep = build_service()
+        views = svc.list_peers()
+        original = svc.target.fs[CONF_PATH]
+        with self.assertRaises(ValueError) as ctx:
+            svc.update_peer(views[0].pubkey, allowed_ips="10.8.0.3/32")
+        self.assertIn("已被", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx2:
+            svc.update_peer(views[0].pubkey, allowed_ips="10.8.0.1")  # 服务器自己
+        self.assertIn("服务器自己", str(ctx2.exception))
+        with self.assertRaises(ValueError):
+            svc.update_peer(views[0].pubkey, allowed_ips="0.0.0.0/0")
+        self.assertEqual(svc.target.fs[CONF_PATH], original)  # 一个字节都没写
+
+    def test_update_peer_rejects_duplicate_name(self):
+        _backend, svc, _dep = build_service()
+        views = svc.list_peers()
+        with self.assertRaises(ValueError):
+            svc.update_peer(views[0].pubkey, name="lisi-phone")
+        # 改成自己原来的名字不算冲突
+        self.assertFalse(svc.update_peer(views[0].pubkey, name="zhangsan-laptop").changed)
+
+    def test_update_peer_without_change_does_not_write(self):
+        _backend, svc, _dep = build_service()
+        view = svc.list_peers()[0]
+        original = svc.target.fs[CONF_PATH]
+        res = svc.update_peer(view.pubkey, name=view.raw_name, note=view.note,
+                              allowed_ips=view.allowed_ips)
+        self.assertEqual(res.changed, [])
+        self.assertEqual(res.backup, "")
+        self.assertEqual(svc.target.fs[CONF_PATH], original)
+        self.assertFalse(any("wgmgr.bak" in k for k in svc.target.fs))
+
+    def test_update_peer_missing_pubkey(self):
+        _backend, svc, _dep = build_service()
+        with self.assertRaises(ValueError):
+            svc.update_peer("not-a-real-key", name="x")
+
+    def test_update_peer_out_of_subnet_warns(self):
+        _backend, svc, _dep = build_service()
+        key = svc.list_peers()[0].pubkey
+        res = svc.update_peer(key, allowed_ips="192.168.50.9/32")
+        self.assertTrue(any("VPN 网段" in w for w in res.warnings))
 
 
 class _FakeChannel:
