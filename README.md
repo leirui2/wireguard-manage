@@ -6,6 +6,17 @@
 
 [![Build](https://github.com/leirui2/wireguard-manage/actions/workflows/build.yml/badge.svg)](https://github.com/leirui2/wireguard-manage/actions/workflows/build.yml)
 
+### ⬇️ 直接下载
+
+| 版本 | 下载 | 说明 |
+|---|---|---|
+| **最新构建** | **[WireGuardManager.exe](https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager.exe)** | 每次推送到 `main` 自动重新打包，链接永久不变 |
+
+SHA256 校验值见同一发行版下的 [SHA256.txt](https://github.com/leirui2/wireguard-manage/releases/latest/download/SHA256.txt)。
+
+> Windows 10 / 11 64 位，双击即用，**不需要安装 Python 或任何运行库**。
+> 也可以到 [Releases 页面](https://github.com/leirui2/wireguard-manage/releases) 查看历史版本。
+
 ---
 
 ## 功能特性
@@ -32,7 +43,8 @@
 
 ### 方式一：直接用 exe（推荐给最终用户）
 
-1. 到 [Releases](../../releases) 或 Actions 的 Artifacts 下载 `WireGuard密钥管理工具.exe`
+1. 下载 [WireGuardManager.exe](https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager.exe)
+   （或到 [Releases](../../releases) 页面挑历史版本）
 2. 放到**有写权限的目录**（桌面、D 盘、U 盘都行，**不要放 `C:\Program Files`**）
 3. 双击运行
 
@@ -218,16 +230,30 @@ PyInstaller 打包的程序没有代码签名，容易被误报。添加信任�
 
 ---
 
-## 自动构建
+## 自动构建与发布
 
-推送到 `main` 分支或手动触发时，GitHub Actions 会在 `windows-latest` 上：
+推送到 `main` 分支、打 `v*` 标签，或在 Actions 页面手动触发时，GitHub Actions 会在 `windows-latest` 上：
 
 1. 安装 Python 3.13 与依赖
-2. 用 `wireguard-manager.spec` 打包
-3. 把 exe 作为 Artifact 上传（保留 30 天）
+2. 跑一遍单元测试（不通过就不打包）
+3. 用 `wireguard-manager.spec` 打包单文件 exe
+4. 校验产物体积、计算 SHA256
+5. **自动发布到 Releases** 并附上 exe 与校验值
 
-也可以在 Actions 页面点 **Run workflow** 手动构建。
-构建过程**不需要任何 Secrets**，仓库里也不含任何服务器凭据。
+发布规则：
+
+| 触发方式 | 结果 |
+|---|---|
+| 推送到 `main` | 更新滚动发行版 **`latest`**（同名资产覆盖，仓库里始终只有一条，下载链接永久固定） |
+| 推送 `v1.0.0` 这类标签 | 新建对应版本的正式发行版，自动生成变更说明 |
+| 手动 Run workflow | 同推送到 `main` |
+
+同时在 Actions 里保留一份 Artifact（30 天）。
+
+整个流程**不需要任何 Secrets**（用的是仓库自带的 `GITHUB_TOKEN`），也不需要你在页面上点任何按钮。
+
+> 注意：exe 放在 **Releases**，不是右侧的「包 / Packages」。
+> Packages 只接收 npm / Maven / NuGet / Docker 这类包格式，不接受任意二进制文件。
 
 ---
 

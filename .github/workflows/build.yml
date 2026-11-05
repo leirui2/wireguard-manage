@@ -3,14 +3,19 @@ name: Build Windows EXE
 on:
   push:
     branches: [main, master]
+    tags: ["v*"]
   workflow_dispatch:
 
+# GITHUB_TOKEN 默认只有读权限，创建 Release 需要显式申请写权限
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  EXE_NAME: WireGuardManager.exe
 
 jobs:
   build:
@@ -43,13 +48,20 @@ jobs:
       - name: Build single-file exe
         run: python -m PyInstaller --noconfirm --clean wireguard-manager.spec
 
-      - name: Sanity check output
+      - name: Sanity check and prepare release asset
         shell: pwsh
         run: |
           $exe = Get-ChildItem -Path dist -Filter *.exe | Select-Object -First 1
           if ($null -eq $exe) { throw "No exe was produced in dist/" }
           Write-Host ("Built: {0} ({1:N1} MB)" -f $exe.Name, ($exe.Length / 1MB))
           if ($exe.Length -lt 5MB) { throw "exe looks too small, build likely incomplete" }
+
+          # 发行版资产用纯 ASCII 文件名，下载链接不含转义字符，复制到任何地方都不会乱码
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item $exe.FullName "release/$env:EXE_NAME" -Force
+          $hash = (Get-FileHash "release/$env:EXE_NAME" -Algorithm SHA256).Hash
+          "$hash  $env:EXE_NAME" | Out-File -FilePath "release/SHA256.txt" -Encoding ascii
+          Write-Host "SHA256: $hash"
 
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
@@ -58,3 +70,54 @@ jobs:
           path: dist/*.exe
           retention-days: 30
           if-no-files-found: error
+
+      # ---- 推送到 main / master：更新「最新构建」滚动发行版 ----
+      # 同一个 tag "latest" 反复复用，资产同名覆盖，仓库里始终只有一条，下载地址永久固定
+      - name: Publish rolling release (latest)
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: 最新构建 v1.0.${{ github.run_number }}
+          make_latest: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body: |
+            > 由 GitHub Actions 自动构建，无需手动操作。
+
+            **提交**：`${{ github.sha }}`
+            **构建号**：#${{ github.run_number }}
+            **分支**：`${{ github.ref_name }}`
+
+            ### 下载
+            点下面的 `WireGuardManager.exe` 即可。目标机器 **不需要安装 Python**，
+            也不需要任何运行库，拷贝过去双击就能用。
+
+            - 需要 64 位 Windows 10 / 11
+            - 不要放在 `C:\Program Files`（程序要往自己旁边写配置和客户端文件）
+            - 首次启动约 2~4 秒（单文件包需自解压）
+            - 无代码签名，杀软提示"未知发布者"时选「仍要运行」
+
+            校验值见 `SHA256.txt`。
+          files: |
+            release/WireGuardManager.exe
+            release/SHA256.txt
+
+      # ---- 打 tag（v1.0.0 这种）：发布正式版本 ----
+      - name: Publish versioned release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          make_latest: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body: |
+            版本 `${{ github.ref_name }}`，由 GitHub Actions 自动构建。
+
+            下载 `WireGuardManager.exe` 直接运行，目标机器无需安装 Python。
+            校验值见 `SHA256.txt`。
+          files: |
+            release/WireGuardManager.exe
+            release/SHA256.txt
