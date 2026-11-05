@@ -19,6 +19,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from . import __version__
 from .backend import make_backend
 from .downloads import CLIENTS, OFFICIAL_INSTALL_PAGE, open_url
+from .history import History
 from .installer import Options as InstallOptions
 from .installer import build_plan, run_install
 from .probe import ProbeError, ServerMissing, probe
@@ -46,6 +47,7 @@ from .util import (
     safe_filename,
     stamp,
 )
+from .vault import Vault
 
 
 def app_dir() -> str:
@@ -190,6 +192,10 @@ class App:
         self.service: WGService | None = None
         self.views = []
         self.row_keys: dict[str, str] = {}
+        # 客户端配置保险箱：key 是客户端公钥（改名不变），内容是加密后的 .conf
+        self.vault = Vault(APP_DIR)
+        # 本地配置历史：每次改动前存一份原样，可预览、可还原
+        self.history = History(APP_DIR)
 
         self._build()
         self.root.after(120, self._poll)
@@ -366,6 +372,12 @@ class App:
         self.clients_btn = ttk.Button(bar, text="打开配置目录", width=14,
                                       command=self._open_clients_dir)
         self.clients_btn.pack(side="right", padx=4)
+        self.history_btn = ttk.Button(bar, text="配置历史", width=11,
+                                      command=self.show_history, state="disabled")
+        self.history_btn.pack(side="right", padx=4)
+        self.client_btn = ttk.Button(bar, text="客户端配置", width=13,
+                                     command=self.show_client_conf, state="disabled")
+        self.client_btn.pack(side="right", padx=4)
         self.delete_btn = ttk.Button(bar, text="删除选中", width=12,
                                      command=self.delete_selected, state="disabled")
         self.delete_btn.pack(side="right", padx=4)
@@ -631,7 +643,8 @@ class App:
     def _set_buttons(self) -> None:
         connected = self.service is not None
         enabled = connected and not self.busy
-        for btn in (self.refresh_btn, self.add_btn, self.edit_btn, self.delete_btn):
+        for btn in (self.refresh_btn, self.add_btn, self.edit_btn,
+                    self.delete_btn, self.client_btn, self.history_btn):
             btn.configure(state="normal" if enabled else "disabled")
         self.connect_btn.configure(state="normal" if (not self.busy and not connected) else "disabled")
         self.disconnect_btn.configure(state="normal" if (connected and not self.busy) else "disabled")
@@ -689,7 +702,7 @@ class App:
             backend = make_backend(conn, log=self._log)
             try:
                 target, dep = probe(backend, conn, self._log)
-                svc = WGService(target, dep, self._log)
+                svc = WGService(target, dep, self._log, history=self.history)
                 views = svc.list_peers()
             except ServerMissing as exc:
                 # 保留这条连接，装完直接用，不用重新输密码
@@ -786,7 +799,7 @@ class App:
 
         def work():
             target, dep = probe(backend, conn, self._log)
-            svc = WGService(target, dep, self._log)
+            svc = WGService(target, dep, self._log, history=self.history)
             return {"kind": "ok", "backend": backend, "target": target,
                     "dep": dep, "service": svc, "views": svc.list_peers()}
 
@@ -845,8 +858,11 @@ class App:
             return self.service.add_peer(**params)
 
         def done(result):
+            path = ""
+            file_name = ""
             if save_file:
-                path = os.path.join(CLIENTS_DIR, f"{safe_filename(result.name)}.conf")
+                file_name = f"{safe_filename(result.name)}.conf"
+                path = os.path.join(CLIENTS_DIR, file_name)
                 try:
                     os.makedirs(CLIENTS_DIR, exist_ok=True)
                     with open(path, "w", encoding="utf-8", newline="\n") as f:
@@ -854,8 +870,13 @@ class App:
                 except Exception as exc:
                     self._append_log(f"保存客户端配置失败：{exc}")
                     path = ""
+            # 加密留一份：之后才能重看二维码、重新导出、换 IP 后重建配置
+            if self.vault.put(result.public_key, result.name,
+                              result.client_conf, file_name):
+                self._append_log("客户端配置已加密保存，之后可随时重看二维码或重新导出")
             else:
-                path = ""
+                self._append_log("客户端配置没能加密保存 —— 关掉这个窗口就找不回了，"
+                                 "请务必点「另存为」把 .conf 存下来")
             ClientConfDialog(self.root, result, path, self._append_log)
             self._append_log(f"服务器备份：{result.backup}")
             self._append_log(result.reload_msg)
@@ -888,6 +909,9 @@ class App:
             return self.service.remove_peers(keys)
 
         def done(names):
+            # 密钥已经从服务器删掉，客户端配置再用不上了，顺手清掉免得越积越多
+            for k in keys:
+                self.vault.drop(k)
             self._append_log("已删除：" + "、".join(names))
             self.refresh()
 
@@ -922,6 +946,7 @@ class App:
                 self._append_log(f"「{view.name}」没有变化")
                 return
             self._append_log(f"已修改「{res.name}」：{'、'.join(res.changed)}")
+            self.vault.rename(res.public_key, res.name)
             if res.backup:
                 self._append_log(f"服务器备份：{res.backup}")
             if res.reload_msg:
@@ -985,6 +1010,60 @@ class App:
             "请直接在那个设备上改。",
             parent=self.root,
         )
+
+    # ------------------------------------------------------ 客户端配置保险箱
+    def show_client_conf(self) -> None:
+        """读取当初加密保存的客户端配置，重看二维码 / 重新导出 .conf。"""
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("未选择", "请先在列表里选中一条密钥", parent=self.root)
+            return
+        key = self.row_keys.get(selected[0])
+        view = next((v for v in self.views if v.pubkey == key), None)
+        if not view:
+            return
+        entry = self.vault.get(view.pubkey)
+        if not entry:
+            messagebox.showinfo(
+                "本机没有它的客户端配置",
+                f"「{view.name}」的客户端配置不在本机保险箱里。\n\n"
+                "可能的原因：\n"
+                "• 这条密钥不是本工具生成的（比如在服务器上手工加的）\n"
+                "• 生成的那次加密保存失败了\n"
+                "• 保险箱是在别的机器 / 别的 Windows 账号下建的，解不开\n\n"
+                "服务端只存公钥，私钥拿不回来 —— 想重新给这个客户端配，"
+                "只能删掉它再新增一条。",
+                parent=self.root,
+            )
+            return
+        SavedConfDialog(self.root, view.name, entry, self._append_log)
+
+    # ---------------------------------------------------------------- 配置历史
+    def show_history(self) -> None:
+        if not self.service:
+            messagebox.showinfo("还没连上", "先连上服务器，才能查看和还原配置历史",
+                                parent=self.root)
+            return
+        host = (self.conn or {}).get("endpoint_host") or (self.conn or {}).get("host", "")
+        HistoryDialog(self.root, self.history, host, self._append_log,
+                      self._restore_snapshot,
+                      open_dir=self.history.root)
+
+    def _restore_snapshot(self, text: str, entry: dict) -> None:
+        """把选中的快照写回服务器。走 service.restore，和普通改动同一套安全流程。"""
+        def work():
+            return self.service.restore(text, label=f"恢复到 {entry['time']} 的状态")
+
+        def done(res):
+            self._append_log(
+                f"配置已还原到 {entry['time']} 的状态（{entry['action']}之前的快照）")
+            if res.backup:
+                self._append_log(f"还原前的状态也备份了一份：{res.backup}")
+            if res.reload_msg:
+                self._append_log(res.reload_msg)
+            self.refresh()
+
+        self._async("还原配置", work, done)
 
     # ---------------------------------------------------------------- 其它
     def _show_selected_detail(self) -> None:
@@ -1299,7 +1378,7 @@ class ClientConfDialog:
                  f"公钥：{result.public_key}\n服务器备份：{result.backup}",
             justify="left", wraplength=640,
         ).pack(fill="x", pady=(0, 8))
-        ttk.Label(frame, text="客户端配置（请立即保存，私钥不会再次显示）：",
+        ttk.Label(frame, text="客户端配置（含私钥，请妥善保管）：",
                   foreground="#a05000").pack(anchor="w")
         text = scrolledtext.ScrolledText(frame, height=16, font=("Consolas", 10))
         text.pack(fill="both", expand=True, pady=6)
@@ -1346,10 +1425,188 @@ class ClientConfDialog:
         show_dialog(top, parent, width=680, height=520)
 
 
+class SavedConfDialog:
+    """展示保险箱里存着的客户端配置 —— 生成那次没另存 .conf 也能重来一遍。"""
+
+    def __init__(self, parent, name: str, entry: dict, log):
+        top = tk.Toplevel(parent)
+        top.withdraw()
+        top.title(f"「{name}」的客户端配置")
+        frame = ttk.Frame(top, padding=14)
+        frame.pack(fill="both", expand=True)
+
+        created = (entry.get("created") or "").replace("T", " ")
+        ttk.Label(
+            frame,
+            text=f"名称：{name}    保存于：{created or '未知'}\n"
+                 "以下内容含客户端私钥，可直接导入手机 / 电脑的 WireGuard 客户端，别外传。",
+            justify="left", wraplength=640,
+        ).pack(fill="x", pady=(0, 8))
+
+        text = scrolledtext.ScrolledText(frame, height=16, font=("Consolas", 10))
+        text.pack(fill="both", expand=True, pady=6)
+        text.insert("1.0", entry["conf"])
+        text.configure(state="disabled")
+
+        link = ttk.Label(frame, text="还没装 WireGuard 客户端？点这里下载（安卓 / iOS / Windows）",
+                         foreground="#0a5bd3", cursor="hand2")
+        link.pack(anchor="w", pady=(6, 0))
+        link.bind("<Button-1>", lambda _e: DownloadDialog(top))
+
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", pady=(8, 0))
+
+        def copy_all():
+            top.clipboard_clear()
+            top.clipboard_append(entry["conf"])
+            log("客户端配置已复制到剪贴板")
+
+        def save_as():
+            path = filedialog.asksaveasfilename(
+                parent=top, title="保存客户端配置",
+                initialfile=f"{safe_filename(name)}.conf",
+                defaultextension=".conf",
+                filetypes=[("WireGuard 配置", "*.conf"), ("所有文件", "*.*")],
+            )
+            if path:
+                try:
+                    with open(path, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(entry["conf"])
+                except Exception as exc:
+                    messagebox.showwarning("保存失败", str(exc), parent=top)
+                    return
+                log(f"客户端配置已另存为 {path}")
+
+        ttk.Button(bar, text="复制全部", width=12, command=copy_all).pack(side="left")
+        ttk.Button(bar, text="另存为…", width=12, command=save_as).pack(side="left", padx=6)
+        ttk.Button(bar, text="生成二维码", width=13, style="Accent.TButton",
+                   command=lambda: QrDialog(
+                       top, f"「{name}」的二维码", entry["conf"],
+                       safe_filename(name), log,
+                   )).pack(side="left")
+        ttk.Button(bar, text="关闭", width=12, command=top.destroy).pack(side="right")
+        show_dialog(top, parent, width=680, height=520)
+
+
+class HistoryDialog:
+    """配置历史：左边每次「改动前」的快照，右边预览，可一键还原。"""
+
+    def __init__(self, parent, history, host: str, log, restore_cb, open_dir: str = ""):
+        self.history = history
+        self.host = host
+        self.log = log
+        self.restore_cb = restore_cb
+        self.dir_path = open_dir or getattr(history, "root", "")
+        self._rows: dict[str, dict] = {}
+        self._current: tuple[str, dict] | None = None
+
+        self.top = top = tk.Toplevel(parent)
+        top.withdraw()
+        top.title("配置历史（每次改动前的原样）")
+        frame = ttk.Frame(top, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True)
+
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="y")
+        cols = ("time", "action", "summary", "peers")
+        self.tree = ttk.Treeview(left, columns=cols, show="headings", height=18)
+        for col, title, width in (
+            ("time", "时间", 132), ("action", "操作", 82),
+            ("summary", "摘要", 225), ("peers", "密钥数", 58),
+        ):
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=width, minwidth=48, anchor="w")
+        vsb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="y", expand=True)
+        vsb.pack(side="left", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        self.preview = scrolledtext.ScrolledText(right, height=18, wrap="none",
+                                                 font=("Consolas", 9))
+        self.preview.pack(fill="both", expand=True)
+        self.preview.configure(state="disabled")
+
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", pady=(10, 0))
+        self.restore_btn = ttk.Button(bar, text="还原到此版本", width=15,
+                                      style="Accent.TButton", command=self._restore,
+                                      state="disabled")
+        self.restore_btn.pack(side="left")
+        ttk.Button(bar, text="打开历史目录", width=14,
+                   command=self._open_dir).pack(side="left", padx=6)
+        ttk.Button(bar, text="关闭", width=10, command=top.destroy).pack(side="right")
+        self.hint = ttk.Label(bar, text="", foreground="#8a8a8a")
+        self.hint.pack(side="right", padx=10)
+
+        self._load()
+        show_dialog(top, parent, width=880, height=560)
+
+    def _load(self) -> None:
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        self._rows = {}
+        entries = self.history.entries(self.host)
+        for entry in entries:
+            iid = self.tree.insert("", "end", values=(
+                (entry.get("time") or "").replace("T", " "),
+                entry.get("action", ""),
+                entry.get("summary", ""),
+                entry.get("peers", 0),
+            ))
+            self._rows[iid] = entry
+        self.hint.configure(text=f"共 {len(entries)} 条快照")
+
+    def _on_select(self, _event=None) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            return
+        entry = self._rows.get(selected[0])
+        if not entry:
+            return
+        text = self.history.read(entry["id"])
+        self.preview.configure(state="normal")
+        self.preview.delete("1.0", "end")
+        self.preview.insert("1.0", text or "（这份快照的文件已经不在了）")
+        self.preview.configure(state="disabled")
+        self._current = (text, entry)
+        self.restore_btn.configure(state="normal" if text else "disabled")
+
+    def _restore(self) -> None:
+        if not self._current:
+            return
+        text, entry = self._current
+        when = (entry.get("time") or "").replace("T", " ")
+        if not messagebox.askyesno(
+            "确认还原",
+            f"把服务器配置还原到 {when} 的状态？\n\n"
+            f"那份快照里有 {entry.get('peers', 0)} 个密钥，"
+            "还原后服务器上就是这个数量。\n\n"
+            "还原前会先备份当前配置，替换后自动热加载。\n"
+            "还原错了也没关系 —— 当前状态同样会进历史，可以再退回来。",
+            icon="question", parent=self.top,
+        ):
+            return
+        self.top.destroy()
+        self.restore_cb(text, entry)
+
+    def _open_dir(self) -> None:
+        try:
+            os.startfile(self.dir_path)  # noqa: S606 - Windows only
+        except Exception:
+            messagebox.showinfo("历史目录", self.dir_path, parent=self.top)
+
+
 class QrDialog:
     """把客户端配置渲染成二维码，手机 WireGuard App 扫码即可导入。
 
-    只在「刚生成密钥」这一步可用：服务端只存公钥，事后无法再导出客户端私钥。
+    客户端私钥只在生成那一刻出现，服务端只存公钥。事后还能重看，是因为生成时
+    把整份 .conf 加密存进了 clients.vault.json（见 vault.py），不是从服务器读的。
     """
 
     def __init__(self, parent, title: str, payload: str, filename_hint: str, log):

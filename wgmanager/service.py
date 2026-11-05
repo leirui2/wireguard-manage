@@ -134,10 +134,13 @@ def build_client_conf(
 
 
 class WGService:
-    def __init__(self, target: Backend, dep: Deployment, log=lambda _m: None):
+    def __init__(self, target: Backend, dep: Deployment, log=lambda _m: None,
+                 history=None):
         self.target = target
         self.dep = dep
         self.log = log
+        # 有 history 就在每次写入前留一份本地快照；没有也能正常工作
+        self.history = history
 
     # ------------------------------------------------------------------ 查看
     def refresh_conf(self) -> WGConfig:
@@ -244,7 +247,9 @@ class WGService:
             comment=f"由 WireGuard 密钥管理工具生成 | {name} | {created}",
         )
 
-        applied = self._apply(conf.render(), expect_present={pub}, expect_absent=set())
+        applied = self._apply(conf.render(), expect_present={pub}, expect_absent=set(),
+                              action="新增密钥",
+                              summary=f"{name} / {', '.join(addresses)}")
         self.log(f"已新增密钥「{name}」，VPN 地址 {', '.join(addresses)}")
         return AddResult(
             name=name,
@@ -329,7 +334,9 @@ class WGService:
             )
 
         conf.update_peer(peer, name=new_name, note=new_note, allowed_ips=new_allowed)
-        applied = self._apply(conf.render(), expect_present={pubkey}, expect_absent=set())
+        applied = self._apply(conf.render(), expect_present={pubkey}, expect_absent=set(),
+                              action="修改密钥",
+                              summary=f"{result.name}：{'、'.join(changed)}")
         result.backup = applied.backup
         result.reload_msg = applied.reload_msg
         result.warnings = warnings + list(applied.warnings)
@@ -399,9 +406,37 @@ class WGService:
             conf.render(),
             expect_present=set(),
             expect_absent={p.public_key for p in matched},
+            action="删除密钥",
+            summary="、".join(names),
         )
         self.log(f"已删除 {len(matched)} 个密钥：{', '.join(names)}")
         return names
+
+    # ------------------------------------------------------------------ 还原
+    def restore(self, text: str, *, label: str = "") -> ApplyResult:
+        """把某份历史配置整体写回服务器。
+
+        走的还是 ``_apply`` 那条路：先备份当前配置，再原子替换、热加载、校验，
+        失败自动回滚。所以还原本身也是可撤销的 —— 它会把当前状态也存进历史，
+        还原错了还能再退回去。
+        """
+        if not (text or "").strip():
+            raise ValueError("这份快照是空的，没法还原")
+        target = WGConfig(text)
+        if not target.interface():
+            raise ValueError("这份快照里没有 [Interface] 段，不像 WireGuard 配置")
+
+        want = {p.public_key for p in target.peers()}
+        current = {p.public_key for p in self.refresh_conf().peers()}
+        applied = self._apply(
+            target.render(),
+            expect_present=want,
+            expect_absent=current - want,
+            action="还原配置",
+            summary=label or f"恢复到 {len(want)} 个密钥的状态",
+        )
+        self.log(f"已还原配置：{len(want)} 个密钥")
+        return applied
 
     # -------------------------------------------------------------- 写入 / 回滚
     def _reload(self) -> tuple[bool, str]:
@@ -439,9 +474,26 @@ class WGService:
             self.log(f"!! 回滚失败，请立即手工恢复：cp -p {backup} {self.dep.conf_path}")
 
     def _apply(
-        self, new_text: str, *, expect_present: set[str], expect_absent: set[str]
+        self, new_text: str, *, expect_present: set[str], expect_absent: set[str],
+        action: str = "", summary: str = "",
     ) -> ApplyResult:
         conf_path = self.dep.conf_path
+
+        # 先把"改动前"的原样存到本地。服务器上的备份要 ssh 进去才看得见，
+        # 界面上要挑一个旧版本还原，就得有一份本地历史。
+        # 存不上不能影响正常改动，所以整段吞异常。
+        if self.history is not None and self.dep.conf_text:
+            try:
+                self.history.record(
+                    host=self.dep.endpoint_host or "",
+                    text=self.dep.conf_text,
+                    action=action,
+                    summary=summary,
+                    peers=len(WGConfig(self.dep.conf_text).peers()),
+                )
+            except Exception as exc:
+                self.log(f"本地快照没存上（不影响本次改动）：{exc}")
+
         backup = f"{conf_path}.wgmgr.bak.{stamp()}"
 
         bk = self.target.run(f"cp -p {_q(conf_path)} {_q(backup)}", root=True)

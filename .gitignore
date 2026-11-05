@@ -59,3 +59,10 @@ build_assets/qr_dialog.png
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 客户端配置保险箱：存的是加密后的客户端私钥，绝对不能进仓库
+clients.vault.json
+clients.vault.json.tmp
+
+# 本地配置历史：含服务器私钥的 wg0.conf 快照，同样不能进仓库
+history/
