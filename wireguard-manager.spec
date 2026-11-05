@@ -6,7 +6,11 @@
 """
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ["paramiko"] + collect_submodules("paramiko")
+hiddenimports = (
+    ["paramiko", "segno"]
+    + collect_submodules("paramiko")
+    + collect_submodules("segno")
+)
 
 a = Analysis(
     ["main.py"],
