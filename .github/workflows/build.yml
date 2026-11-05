@@ -49,6 +49,7 @@ jobs:
       # 本地打包出来是 1.0.16，CI 出来是 1.0.16.14 —— 四段号恒大于三段号，
       # 两边编号体系不同也不会再出现"线上版本比本地还小"的倒挂。
       - name: Stamp version
+        id: ver
         shell: pwsh
         run: |
           if ($env:GITHUB_REF -like "refs/tags/v*") {
@@ -61,6 +62,7 @@ jobs:
             $ver = "$base.${{ github.run_number }}"
           }
           Write-Host "Stamped version: $ver"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$ver"
           python build_assets/stamp_version.py $ver
           Get-Content version.txt
           Select-String -Path wgmanager/__init__.py -Pattern "__version__"
@@ -106,8 +108,9 @@ jobs:
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: v1.0.${{ github.run_number }}
+          # 用 Stamp 步骤算出来的版本号，保证 tag、release 名、version.txt 三者一致
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
           make_latest: true
           overwrite_files: true
           fail_on_unmatched_files: true
