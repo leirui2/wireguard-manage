@@ -27,8 +27,14 @@ if not "%~1"=="" (
     exit /b 1
   )
 ) else (
-  echo [INFO] No version given, using the one in wgmanager\__init__.py
-  echo        Usage: %~nx0 1.0.12  to stamp a version before building.
+  echo Resolving version from the published release...
+  "%PY%" "%ROOT%build_assets\resolve_version.py"
+  if errorlevel 1 (
+    echo.
+    echo [ERROR] Failed to resolve version.
+    pause
+    exit /b 1
+  )
 )
 
 "%PY%" -m PyInstaller --noconfirm --clean "%ROOT%wireguard-manager.spec"

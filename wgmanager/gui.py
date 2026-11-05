@@ -45,6 +45,7 @@ from .updater import (
     fetch_sha,
     is_newer,
     pending_update,
+    release_line,
     update_dir,
 )
 from .util import (
@@ -632,7 +633,15 @@ class App:
 
     def _on_update_info(self, latest: Latest) -> None:
         self.update_btn.configure(state="normal", text="检查更新")
-        if not is_newer(latest.version, __version__):
+        # 只比发布线（前三段）。CI 每次 push 都会在基线后面追加构建号，
+        # 按完整号比较的话本地包永远"少一位"，会一直提示有新版本 ——
+        # 明明两边就是同一份代码，只是构建批次不同。
+        if not is_newer(release_line(latest.version),
+                        release_line(__version__)):
+            if latest.version and latest.version != __version__:
+                self._append_log(
+                    f"线上有同一发布线的新构建 {latest.version}"
+                    f"（当前 {__version__}），内容差异不大，不提示更新")
             self.update_hint.configure(text="已是最新版本", foreground="#0a7a3d")
             messagebox.showinfo(
                 "检查更新",

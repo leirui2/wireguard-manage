@@ -87,6 +87,21 @@ def normalize_version(text: str) -> str:
     return ".".join(str(part) for part in parts) if parts else ""
 
 
+def release_line(version: str, keep: int = 3) -> str:
+    """取版本号里的「发布线」，丢掉 CI 追加的构建号。
+
+    ``1.0.17.16`` → ``1.0.17``。CI 每次 push 都会在基线后面追加构建号
+    （见 .github/workflows/build.yml），如果检查更新按完整号比较，
+    本地打出来的包永远比线上"少一位"，于是天天提示有新版本 —— 但实际上
+    两边可能是同一份代码。
+
+    所以只在发布线变化时才提示：1.0.17.x → 1.0.18 会提示，
+    1.0.17.16 → 1.0.17.17 不提示（只是同一版本的又一次构建）。
+    """
+    parts = parse_version(version)[:keep]
+    return ".".join(str(part) for part in parts) if parts else ""
+
+
 # ------------------------------------------------------------------ 查询
 
 def _check_host(url: str) -> None:

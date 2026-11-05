@@ -934,6 +934,30 @@ class TestUpdater(unittest.TestCase):
         self.assertFalse(is_newer("1.0.10", "1.0.10"))
         self.assertTrue(is_newer("1.1", "1.0.99"))
 
+    def test_release_line_ignores_ci_build_number(self):
+        """CI 会在基线后面追加构建号，检查更新只该比发布线。
+
+        否则本地打出来的 1.0.17 永远小于线上的 1.0.17.16，
+        点多少次「检查更新」都在提示有新版本。
+        """
+        from wgmanager.updater import is_newer, release_line
+
+        self.assertEqual(release_line("1.0.17.16"), "1.0.17")
+        self.assertEqual(release_line("v1.0.17"), "1.0.17")
+        self.assertEqual(release_line("1.0"), "1.0")
+        self.assertEqual(release_line(""), "")
+
+        # 同一发布线内，构建号不同不算新版本
+        self.assertFalse(is_newer(release_line("1.0.17.16"),
+                                  release_line("1.0.17")))
+        self.assertFalse(is_newer(release_line("1.0.17.17"),
+                                  release_line("1.0.17.16")))
+        # 发布线变了才算
+        self.assertTrue(is_newer(release_line("1.0.18.0"),
+                                 release_line("1.0.17.16")))
+        self.assertTrue(is_newer(release_line("1.1.0"),
+                                 release_line("1.0.99")))
+
     def test_rejects_non_official_host(self):
         from wgmanager.updater import UpdateError, _check_host
 
