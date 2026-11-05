@@ -28,7 +28,7 @@ if not "%~1"=="" (
   )
 ) else (
   echo [INFO] No version given, using the one in wgmanager\__init__.py
-  echo        Use "打包exe.bat 1.0.12" to stamp a version before building.
+  echo        Usage: %~nx0 1.0.12  to stamp a version before building.
 )
 
 "%PY%" -m PyInstaller --noconfirm --clean "%ROOT%wireguard-manager.spec"

@@ -4,14 +4,14 @@ chcp 65001 >nul 2>&1
 set "ROOT=%~dp0"
 
 rem ---- find a Python that ships tkinter ----
-rem 1) 本机常用的固定路径（不存在会自动跳过，换机器不影响）
+rem 1) Known local install path (skipped if missing, so other machines still work)
 set "PYEXE=E:\JAVA\Python3.13.5\python.exe"
 if not exist "%PYEXE%" set "PYEXE="
-rem 2) 官方 py 启动器
+rem 2) Official py launcher
 if not defined PYEXE (
   for /f "delims=" %%i in ('py -3 -c "import sys;print(sys.executable)" 2^>nul') do if not defined PYEXE set "PYEXE=%%i"
 )
-rem 3) PATH 里的 python.exe
+rem 3) python.exe on PATH
 if not defined PYEXE (
   for /f "delims=" %%i in ('where python.exe 2^>nul') do if not defined PYEXE set "PYEXE=%%i"
 )
