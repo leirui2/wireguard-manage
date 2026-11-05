@@ -89,14 +89,17 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      # ---- 推送到 main / master：更新「最新构建」滚动发行版 ----
-      # 同一个 tag "latest" 反复复用，资产同名覆盖，仓库里始终只有一条，下载地址永久固定
-      - name: Publish rolling release (latest)
+      # ---- 推送到 main / master：每次构建都单独留一条发行版 ----
+      # 以前固定复用 tag "latest"，每次覆盖同一条，导致旧版本一个都留不下。
+      # 现在 tag 用 "v1.0.<构建号>"，每条独立存在，历史可回溯。
+      # 固定下载链接不受影响：GitHub 的 releases/latest/download/... 会自动
+      # 解析到被标记为 latest 的那条（下面 make_latest: true 维持这个标记）。
+      - name: Publish build release
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: 最新构建 v1.0.${{ github.run_number }}
+          tag_name: v1.0.${{ github.run_number }}
+          name: v1.0.${{ github.run_number }}
           make_latest: true
           overwrite_files: true
           fail_on_unmatched_files: true
@@ -117,6 +120,7 @@ jobs:
             - 无代码签名，杀软提示"未知发布者"时选「仍要运行」
 
             校验值见 `SHA256.txt`。
+            历史版本可以在本仓库的 Releases 页面按 tag 找到。
           files: |
             release/WireGuardManager.exe
             release/SHA256.txt
