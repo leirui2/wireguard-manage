@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 13, 0),
-    prodvers=(1, 0, 13, 0),
+    filevers=(1, 0, 14, 0),
+    prodvers=(1, 0, 14, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -15,12 +15,12 @@ VSVersionInfo(
         '080404b0',
         [StringStruct('CompanyName', ''),
          StringStruct('FileDescription', 'WireGuard 密钥管理工具'),
-         StringStruct('FileVersion', '1.0.13.0'),
+         StringStruct('FileVersion', '1.0.14.0'),
          StringStruct('InternalName', 'WireGuardManager'),
          StringStruct('LegalCopyright', ''),
          StringStruct('OriginalFilename', 'WireGuard密钥管理工具.exe'),
          StringStruct('ProductName', 'WireGuard 密钥管理工具'),
-         StringStruct('ProductVersion', '1.0.13.0')])
+         StringStruct('ProductVersion', '1.0.14.0')])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
   ]

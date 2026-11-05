@@ -7,7 +7,9 @@
 from PyInstaller.utils.hooks import collect_submodules
 
 hiddenimports = (
-    ["paramiko", "segno"]
+    # card.py 里 PIL 是函数内延迟导入（只有点「生成卡片」才加载），
+    # 静态分析容易漏掉，这里显式声明
+    ["paramiko", "segno", "PIL", "PIL.Image", "PIL.ImageDraw", "PIL.ImageFont"]
     + collect_submodules("paramiko")
     + collect_submodules("segno")
 )
@@ -26,7 +28,14 @@ a = Analysis(
         "numpy",
         "pandas",
         "matplotlib",
-        "PIL",
+        # Pillow 的可选后端：ImageQt 要 PyQt、ImageTk 走 tkinter PhotoImage、
+        # ImageShow 是调试用的系统看图器，三样都用不上，留着白占十几 MB
+        "PIL.ImageQt",
+        "PIL.ImageTk",
+        "PIL.ImageShow",
+        # 我们只读 PNG（二维码）和写 PNG（卡片），AVIF/WebP 解码器用不到
+        "PIL.AvifImagePlugin",
+        "PIL.WebPImagePlugin",
         "setuptools",
         "pip",
     ],

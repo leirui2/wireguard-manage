@@ -1036,7 +1036,7 @@ class App:
                 parent=self.root,
             )
             return
-        SavedConfDialog(self.root, view.name, entry, self._append_log)
+        SavedConfDialog(self.root, view.name, entry, self._append_log, note=view.note)
 
     # ---------------------------------------------------------------- 配置历史
     def show_history(self) -> None:
@@ -1364,6 +1364,30 @@ class EditDialog:
         self.top.destroy()
 
 
+def _save_card(parent, conf_text: str, name: str, note: str, log) -> None:
+    """生成可发微信的分发卡片（二维码 + 名称 + 服务器 + 备注合成一张图）。"""
+    path = filedialog.asksaveasfilename(
+        parent=parent, title="保存分发卡片",
+        initialfile=f"{safe_filename(name)}-卡片.png",
+        defaultextension=".png",
+        filetypes=[("PNG 图片", "*.png"), ("所有文件", "*.*")],
+    )
+    if not path:
+        return
+    try:
+        from .card import render_card
+
+        render_card(conf_text, name=name, note=note, out_path=path)
+    except Exception as exc:
+        messagebox.showwarning(
+            "生成卡片失败",
+            f"{exc}\n\n可以直接用「生成二维码」代替。",
+            parent=parent,
+        )
+        return
+    log(f"分发卡片已保存到 {path}")
+
+
 class ClientConfDialog:
     def __init__(self, parent, result, saved_path: str, log):
         top = tk.Toplevel(parent)
@@ -1416,19 +1440,24 @@ class ClientConfDialog:
 
         ttk.Button(bar, text="复制全部", width=12, command=copy_all).pack(side="left")
         ttk.Button(bar, text="另存为…", width=12, command=save_as).pack(side="left", padx=6)
-        ttk.Button(bar, text="生成二维码", width=13, style="Accent.TButton",
+        ttk.Button(bar, text="生成二维码", width=12, style="Accent.TButton",
                    command=lambda: QrDialog(
                        top, f"「{result.name}」的二维码", result.client_conf,
                        safe_filename(result.name), log,
                    )).pack(side="left")
-        ttk.Button(bar, text="关闭", width=12, command=top.destroy).pack(side="right")
-        show_dialog(top, parent, width=680, height=520)
+        ttk.Button(bar, text="生成卡片", width=12,
+                   command=lambda: _save_card(
+                       top, result.client_conf, result.name,
+                       getattr(result, "note", ""), log,
+                   )).pack(side="left", padx=6)
+        ttk.Button(bar, text="关闭", width=10, command=top.destroy).pack(side="right")
+        show_dialog(top, parent, width=700, height=520)
 
 
 class SavedConfDialog:
     """展示保险箱里存着的客户端配置 —— 生成那次没另存 .conf 也能重来一遍。"""
 
-    def __init__(self, parent, name: str, entry: dict, log):
+    def __init__(self, parent, name: str, entry: dict, log, note: str = ""):
         top = tk.Toplevel(parent)
         top.withdraw()
         top.title(f"「{name}」的客户端配置")
@@ -1479,13 +1508,17 @@ class SavedConfDialog:
 
         ttk.Button(bar, text="复制全部", width=12, command=copy_all).pack(side="left")
         ttk.Button(bar, text="另存为…", width=12, command=save_as).pack(side="left", padx=6)
-        ttk.Button(bar, text="生成二维码", width=13, style="Accent.TButton",
+        ttk.Button(bar, text="生成二维码", width=12, style="Accent.TButton",
                    command=lambda: QrDialog(
                        top, f"「{name}」的二维码", entry["conf"],
                        safe_filename(name), log,
                    )).pack(side="left")
-        ttk.Button(bar, text="关闭", width=12, command=top.destroy).pack(side="right")
-        show_dialog(top, parent, width=680, height=520)
+        ttk.Button(bar, text="生成卡片", width=12,
+                   command=lambda: _save_card(
+                       top, entry["conf"], name, note, log,
+                   )).pack(side="left", padx=6)
+        ttk.Button(bar, text="关闭", width=10, command=top.destroy).pack(side="right")
+        show_dialog(top, parent, width=700, height=520)
 
 
 class HistoryDialog:

@@ -1,4 +1,5 @@
 # 打包 exe 所需的依赖（本地打包与 GitHub Actions 共用，保证版本一致）
 paramiko==5.1.0
 segno==1.6.6
+Pillow==13.0.0
 pyinstaller==6.22.3

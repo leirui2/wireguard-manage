@@ -75,6 +75,7 @@ class AddResult:
     client_conf: str
     backup: str
     reload_msg: str
+    note: str = ""
 
 
 @dataclass
@@ -259,6 +260,7 @@ class WGService:
             client_conf=client_conf,
             backup=applied.backup,
             reload_msg=applied.reload_msg,
+            note=note,
         )
 
     # ------------------------------------------------------------------ 修改
