@@ -665,13 +665,17 @@ class App:
             pass
         self.root.destroy()
 
-    def _set_buttons(self) -> None:
+    def _set_buttons(self, connecting: bool = False) -> None:
         connected = self.service is not None
         enabled = connected and not self.busy
         for btn in (self.refresh_btn, self.add_btn, self.edit_btn,
                     self.delete_btn, self.client_btn, self.history_btn):
             btn.configure(state="normal" if enabled else "disabled")
-        self.connect_btn.configure(state="normal" if (not self.busy and not connected) else "disabled")
+        # 多服务器下「连接」不再受"已连着一台"限制：随时可以连新的，
+        # 只有正在连的时候才临时禁用，避免重复发起。
+        self.connect_btn.configure(
+            state="disabled" if (self.busy or connecting) else "normal"
+        )
         self.disconnect_btn.configure(state="normal" if (connected and not self.busy) else "disabled")
 
     def _collect_conn(self) -> dict:
@@ -713,6 +717,7 @@ class App:
             conn = self._collect_conn()
         except ValueError as exc:
             messagebox.showwarning("填写不完整", str(exc), parent=self.root)
+            self._refresh_server_combo()   # 下拉回到真实状态，别停在没连上的那项
             return
         self._save_current_profile(conn)
         key = "demo" if conn.get("demo") else _conn_key(conn)
@@ -808,19 +813,60 @@ class App:
 
     def _on_server_selected(self, _event=None) -> None:
         idx = self.server_combo.current()
-        keys = getattr(self, "_server_keys", [])
-        if 0 <= idx < len(keys):
-            self._activate(keys[idx])
-            self._append_log("已切换到 " + self.servers[keys[idx]]["label"])
+        online = getattr(self, "_server_keys", [])
+        offline = getattr(self, "_offline_profiles", [])
+        if 0 <= idx < len(online):
+            self._activate(online[idx])
+            self._append_log("已切换到 " + self.servers[online[idx]]["label"])
+            return
+        j = idx - len(online)
+        if 0 <= j < len(offline):
+            profile = offline[j]
+            self._append_log(f"正在连接 {_server_label(profile)} …")
+            self._connect_profile(profile)
+
+    def _connect_profile(self, profile: dict) -> None:
+        """从下拉里选了一台还没连的：把表单填好再发起连接。"""
+        self.host_var.set(profile.get("host", ""))
+        self.port_var.set(str(profile.get("port", 22)))
+        self.user_var.set(profile.get("username", "root"))
+        self.auth_var.set(profile.get("auth", "password"))
+        self.key_var.set(profile.get("key_path", ""))
+        self.password_var.set(unprotect(profile.get("password", "")))
+        self.key_pass_var.set(unprotect(profile.get("key_passphrase", "")))
+        self.sudo_pwd_var.set(unprotect(profile.get("sudo_password", "")))
+        self.remember_var.set(
+            any(is_sealed(profile.get(k))
+                for k in ("password", "key_passphrase", "sudo_password"))
+        )
+        self._on_auth_change()
+        self.connect()
 
     def _refresh_server_combo(self) -> None:
+        """下拉 = 已连接的服务器 + 已保存但还没连的配置。
+
+        做成统一的"服务器列表"，省得用户每次都要先填表单点连接再切换。
+        """
         self._server_keys = list(self.servers.keys())
-        labels = [self.servers[k]["label"] for k in self._server_keys] or ["（未连接）"]
+        labels = [self.servers[k]["label"] for k in self._server_keys]
+        self._offline_profiles = []
+        for profile in _load_profiles():
+            if _conn_key(profile) in self.servers:
+                continue
+            label = _server_label(profile)
+            if label in labels:
+                continue
+            labels.append(label + "（未连接）")
+            self._offline_profiles.append(profile)
+        if not labels:
+            labels = ["（还没有服务器）"]
         self.server_combo["values"] = labels
         if self.active in self._server_keys:
             self.server_combo.current(self._server_keys.index(self.active))
+        elif self._server_keys or self._offline_profiles:
+            self.server_combo.current(0)
         else:
-            self.server_combo.set("（未连接）")
+            self.server_combo.set("（还没有服务器）")
 
     # ---------------------------------------------------------- 一键装服务端
     def _start_install_flow(self, backend, exc, key: str = "",
@@ -1262,6 +1308,7 @@ class App:
         profiles.insert(0, profile)
         _save_profiles(profiles)
         self._refresh_profile_combo()
+        self._refresh_server_combo()
         if remember and not getattr(self, "_sealed_hint_done", False):
             self._sealed_hint_done = True
             self._log("口令已加密保存在 connections.json（Windows DPAPI，"
