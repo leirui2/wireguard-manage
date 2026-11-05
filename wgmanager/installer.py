@@ -269,6 +269,16 @@ def _iface_exists(target: Backend, iface: str) -> bool:
     return False
 
 
+def has_systemd(target: Backend) -> bool:
+    """自动安装靠 systemctl 起服务，没有 systemd 的系统（Alpine/Devuan/容器）必须提前拦下。"""
+    res = target.run("command -v systemctl", timeout=10)
+    if not (res.ok and (res.out or "").strip()):
+        return False
+    pid1 = target.run("cat /proc/1/comm", root=True, timeout=10)
+    comm = (pid1.out or "").strip()
+    return comm in {"", "systemd"}
+
+
 def build_plan(target: Backend, options: Options, endpoint_host: str = "") -> Plan:
     """只做只读探测，不修改服务器。"""
     plat = detect_platform(target)
@@ -281,6 +291,17 @@ def build_plan(target: Backend, options: Options, endpoint_host: str = "") -> Pl
     plan.forward_enabled = _forward_enabled(target)
 
     net = ipaddress.ip_network(plan.subnet)
+
+    # 没有 systemd 就别往下走了：装完包、写完配置却起不来服务，
+    # 会把服务器留在半装状态，比直接拒绝更糟。
+    if not has_systemd(target):
+        plan.platform.install_cmd = ""
+        plan.platform.notes = [
+            "这台机器没有在用 systemd（Alpine / Devuan / OpenRC，或本身跑在容器里），"
+            "自动安装没法把服务拉起来，已在这里停住，不会改动系统。\n"
+            f"可以手动装 wireguard-tools 后执行 wg-quick up {plan.iface}，"
+            "再用系统自己的 init 加开机自启。",
+        ]
     plan.steps = [
         f"安装 WireGuard（{plat.label}）",
         f"生成服务端密钥对",

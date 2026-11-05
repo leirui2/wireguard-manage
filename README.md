@@ -133,6 +133,22 @@ VPN 网段：  [10.9.0.0/24]    服务端会占 .1，客户端从这里分配
 - **不动已有网络配置**——只新增一条私网路由和一个 NAT 规则（后者由 wg-quick 自己回收）
 - **不支持时明确说不**——发行版识别不出来就直说，不会瞎试
 
+### 支持哪些系统
+
+| 系统 | 装包方式 | 状态 |
+|---|---|---|
+| Ubuntu / **Debian** / Linux Mint / Kali / Deepin / UOS / Armbian / Raspberry Pi OS | `apt-get install wireguard` | Ubuntu 22.04 **已实测**，同一条命令覆盖整个 Debian 系 |
+| RHEL / CentOS / Rocky / AlmaLinux / Fedora / Oracle Linux / openEuler / 麒麟 / Anolis | `dnf` 或 `yum install wireguard-tools` | 代码支持，**未在真机验证**；可能还要 EPEL 的 `kmod-wireguard` |
+| Arch / Manjaro / EndeavourOS | `pacman -S wireguard-tools` | 代码支持，未实测 |
+| openSUSE / SLES | `zypper install wireguard-tools` | 代码支持，未实测 |
+| Alpine / Devuan / Gentoo / Void（非 systemd） | — | **明确拒绝**：起不了服务，宁可不装也不留半成品 |
+| 其它 / 识别不出来 | — | 明确拒绝，并给出手动命令 |
+
+判据是 `/etc/os-release` 里的 `ID` 和 `ID_LIKE`，不靠猜。另外会检查 `/proc/1/comm` 确认
+systemd 真的是 PID 1 —— 在容器里跑的时候 `systemctl` 可能装了但用不了，这种情况也会被拦下。
+
+> Debian 10 及更早的内核没带 WireGuard 模块，需要先开 backports；Debian 11+ 直接装即可。
+
 ### 前提条件
 
 1. 有 **root 或可用的 sudo**（跟读配置的要求一样）

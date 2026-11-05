@@ -538,6 +538,8 @@ def _install_backend(**over):
         "ss -lun": ("UNCONN 0 0 0.0.0.0:51820 0.0.0.0:*\n", "", 0),
         "command -v ufw": ("", "", 1),
         "command -v firewall-cmd": ("", "", 1),
+        "command -v systemctl": ("/usr/bin/systemctl\n", "", 0),
+        "cat /proc/1/comm": ("systemd\n", "", 0),
         "sysctl -n net.ipv4.ip_forward": ("0\n", "", 0),
         "test -e /etc/wireguard/wg0.conf": ("NONE\n", "", 0),
         "wg genkey": (priv + "\n", "", 0),
@@ -675,6 +677,33 @@ class TestInstaller(unittest.TestCase):
         self.assertFalse(plan.platform.supported)
         with self.assertRaises(RuntimeError):
             run_install(backend, plan, Options(), LOG)
+
+    def test_debian_family_uses_apt(self):
+        """Debian / Mint / Kali 等走的都是同一条 apt 路径。"""
+        from wgmanager.installer import parse_os_release, platform_from_release
+
+        for raw in (
+            'ID=debian\nVERSION_ID="12"\nPRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n',
+            'ID=linuxmint\nID_LIKE="ubuntu debian"\nPRETTY_NAME="Linux Mint 21"\n',
+            'ID=kali\nID_LIKE=debian\nPRETTY_NAME="Kali GNU/Linux"\n',
+        ):
+            with self.subTest(raw=raw.splitlines()[0]):
+                plat = platform_from_release(parse_os_release(raw))
+                self.assertEqual(plat.family, "debian")
+                self.assertIn("apt-get install -y wireguard", plat.install_cmd)
+
+    def test_refuses_without_systemd(self):
+        """没有 systemd（Alpine / 容器）要提前停下，不能装到一半。"""
+        from wgmanager.installer import Options, build_plan, run_install
+
+        backend, _pub, _priv = _install_backend(**{"command -v systemctl": ("", "", 1)})
+        plan = build_plan(backend, Options(), "")
+        self.assertFalse(plan.platform.supported)
+        self.assertTrue(any("systemd" in n for n in plan.platform.notes))
+        with self.assertRaises(RuntimeError):
+            run_install(backend, plan, Options(), LOG)
+        # 一条安装命令都不该执行
+        self.assertFalse(any("apt-get" in c for c in backend.commands))
 
 
 class TestServerMissing(unittest.TestCase):
