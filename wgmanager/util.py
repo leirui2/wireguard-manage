@@ -229,7 +229,9 @@ def qr_png(text: str, *, target_px: int = 520, border: int = 3,
     width, _ = qr.symbol_size(scale=1, border=border)
     scale = max(2, min(16, target_px // max(width, 1)))
     buf = io.BytesIO()
-    qr.save(buf, kind="png", scale=scale, border=border)
+    # 明确给黑白色：segno 默认背景是透明的，透明底在深色窗口/某些看图软件里会糊成一片
+    qr.save(buf, kind="png", scale=scale, border=border,
+            dark="#000000", light="#ffffff")
     return buf.getvalue(), int(qr.version)
 
 

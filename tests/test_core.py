@@ -488,6 +488,55 @@ class TestSSHBackend(unittest.TestCase):
         self.assertIn("sudo 密码", res.err)
 
 
+class TestQrDialog(unittest.TestCase):
+    def test_image_survives_garbage_collection(self):
+        """真实路径下没人持有 QrDialog 实例，图片引用必须挂在窗口上，否则界面留白。"""
+        import gc
+
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+
+            from wgmanager.gui import QrDialog
+
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as exc:  # 无图形环境时跳过
+            self.skipTest(f"no display: {exc}")
+
+        try:
+            QrDialog(
+                root, "测试二维码",
+                "[Interface]\nPrivateKey = abc\nAddress = 10.8.0.6/32\n\n"
+                "[Peer]\nPublicKey = xyz\nAllowedIPs = 0.0.0.0/0\n",
+                "t", lambda _m: None,
+            )
+            gc.collect()
+
+            tops = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+            self.assertTrue(tops, "二维码窗口没有创建出来")
+            qr = tops[-1]
+            qr.update_idletasks()
+
+            self.assertTrue(hasattr(qr, "image"), "图片引用没挂在窗口上，会被回收")
+            self.assertGreaterEqual(qr.image.width(), 300)
+
+            def find_image_label(widget):
+                for child in widget.winfo_children():
+                    if isinstance(child, ttk.Label) and str(child.cget("image")):
+                        return child
+                    found = find_image_label(child)
+                    if found is not None:
+                        return found
+                return None
+
+            label = find_image_label(qr)
+            self.assertIsNotNone(label, "窗口里找不到显示图片的控件")
+            self.assertGreaterEqual(label.winfo_reqwidth(), 300, "图片没显示出来（引用被回收）")
+        finally:
+            root.destroy()
+
+
 class TestWindowPlacement(unittest.TestCase):
     def test_center_window(self):
         import re

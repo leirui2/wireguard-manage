@@ -1007,9 +1007,16 @@ class QrDialog:
             show_dialog(top, parent, width=540, height=220)
             return
 
-        # PhotoImage 必须留引用，否则会被垃圾回收、显示成空白
-        self.image = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
-        ttk.Label(frame, image=self.image).pack(pady=(0, 10))
+        # PhotoImage 必须留引用，否则会被垃圾回收、界面留白。
+        # 注意只挂 self.image 不够：QrDialog 是回调里临时 new 出来、没人持有实例，
+        # 构造函数一返回整个对象就被回收。必须把引用挂到 Toplevel 上，
+        # 窗口活多久图片就活多久。
+        img = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
+        self.image = img
+        top.image = img
+        holder = ttk.Frame(frame, borderwidth=1, relief="solid")
+        holder.pack(pady=(0, 10))
+        ttk.Label(holder, image=img).pack(padx=6, pady=6)
         ttk.Label(
             frame,
             text="用手机 WireGuard App 的「扫描二维码」导入。\n"
