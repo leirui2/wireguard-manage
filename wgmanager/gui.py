@@ -166,14 +166,28 @@ def _profile_key(profile: dict) -> tuple[str, int, str]:
     )
 
 
+def _conn_key(conn: dict) -> str:
+    """一台服务器的唯一标识，和配置档用同一套规则（host + port + username）。"""
+    host, port, user = _profile_key(conn)
+    return f"{host}:{port}/{user}"
+
+
+def _server_label(conn: dict) -> str:
+    """下拉里显示的名字。带端口和用户名，同 IP 不同账号才不会混。"""
+    if conn.get("demo"):
+        return "演示模式"
+    return (f"{conn.get('host', '')}:{conn.get('port', 22)} "
+            f"({conn.get('username', '')})")
+
+
 class App:
     def __init__(self):
         _enable_dpi()
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title(f"WireGuard 密钥管理工具  v{__version__}")
-        self.root.geometry("1120x760")
-        self.root.minsize(980, 660)
+        self.root.geometry("1240x760")
+        self.root.minsize(1060, 680)
         _setup_fonts(self.root)
 
         style = ttk.Style()
@@ -192,6 +206,10 @@ class App:
         self.service: WGService | None = None
         self.views = []
         self.row_keys: dict[str, str] = {}
+        # 多服务器：连上的每台都留在 servers 里，切换只是换当前上下文，
+        # 不断开、不重连、不用重新输密码
+        self.servers: dict[str, dict] = {}
+        self.active: str = ""
         # 客户端配置保险箱：key 是客户端公钥（改名不变），内容是加密后的 .conf
         self.vault = Vault(APP_DIR)
         # 本地配置历史：每次改动前存一份原样，可预览、可还原
@@ -202,10 +220,11 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._log("就绪。填好服务器信息后点「连接」；也可以直接勾选「演示模式」先试用。")
         self._refresh_profile_combo()
+        self._refresh_server_combo()
         # 按内容实际需要的尺寸开窗，并限制在屏幕内，避免新增控件被裁切
         self.root.update_idletasks()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        width = min(max(1120, self.root.winfo_reqwidth() + 12), int(sw * 0.94))
+        width = min(max(1240, self.root.winfo_reqwidth() + 12), int(sw * 0.94))
         height = min(max(720, self.root.winfo_reqheight() + 12), int(sh * 0.90))
         center_window(self.root, width, height)
         self._check_pending_update()
@@ -287,7 +306,7 @@ class App:
         ttk.Label(row, text="用户名：").pack(side="left", padx=(14, 0))
         self.user_entry = ttk.Entry(row, textvariable=self.user_var, width=14)
         self.user_entry.pack(side="left")
-        ttk.Label(row, text="已保存：").pack(side="left", padx=(14, 0))
+        ttk.Label(row, text="已保存配置：").pack(side="left", padx=(14, 0))
         self.profile_combo = ttk.Combobox(row, textvariable=self.profile_var,
                                           state="readonly", width=24)
         self.profile_combo.pack(side="left")
@@ -363,13 +382,19 @@ class App:
         frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
         bar = ttk.Frame(frame)
         bar.pack(fill="x", pady=(0, 8))
+        ttk.Label(bar, text="当前服务器：").pack(side="left")
+        self.server_var = tk.StringVar()
+        self.server_combo = ttk.Combobox(bar, textvariable=self.server_var,
+                                         state="readonly", width=22)
+        self.server_combo.pack(side="left")
+        self.server_combo.bind("<<ComboboxSelected>>", self._on_server_selected)
         self.count_var = tk.StringVar(value="共 0 个密钥")
         ttk.Label(bar, textvariable=self.count_var,
-                  font=(CN_FONT, 11, "bold")).pack(side="left")
+                  font=(CN_FONT, 11, "bold")).pack(side="left", padx=(12, 0))
         self.refresh_btn = ttk.Button(bar, text="刷新", width=10, command=self.refresh,
                                       state="disabled")
         self.refresh_btn.pack(side="right", padx=4)
-        self.clients_btn = ttk.Button(bar, text="打开配置目录", width=14,
+        self.clients_btn = ttk.Button(bar, text="配置目录", width=11,
                                       command=self._open_clients_dir)
         self.clients_btn.pack(side="right", padx=4)
         self.history_btn = ttk.Button(bar, text="配置历史", width=11,
@@ -378,10 +403,10 @@ class App:
         self.client_btn = ttk.Button(bar, text="客户端配置", width=13,
                                      command=self.show_client_conf, state="disabled")
         self.client_btn.pack(side="right", padx=4)
-        self.delete_btn = ttk.Button(bar, text="删除选中", width=12,
+        self.delete_btn = ttk.Button(bar, text="删除", width=8,
                                      command=self.delete_selected, state="disabled")
         self.delete_btn.pack(side="right", padx=4)
-        self.edit_btn = ttk.Button(bar, text="编辑选中", width=12,
+        self.edit_btn = ttk.Button(bar, text="编辑", width=8,
                                    command=self.edit_selected, state="disabled")
         self.edit_btn.pack(side="right", padx=4)
         self.add_btn = ttk.Button(bar, text="＋ 新增密钥", width=14,
@@ -690,13 +715,13 @@ class App:
             messagebox.showwarning("填写不完整", str(exc), parent=self.root)
             return
         self._save_current_profile(conn)
+        key = "demo" if conn.get("demo") else _conn_key(conn)
+
+        # 同一台重连：先关掉旧连接，否则会留一个后台会话指着同一台服务器
+        old = self.servers.pop(key, None)
+        if old:
+            self._close_entry(old)
         self.conn = conn
-        if self.backend:  # 上一次连接（比如安装失败后重试）先关掉，避免连接泄漏
-            try:
-                self.backend.close()
-            except Exception:
-                pass
-            self.backend = None
 
         def work():
             backend = make_backend(conn, log=self._log)
@@ -706,42 +731,105 @@ class App:
                 views = svc.list_peers()
             except ServerMissing as exc:
                 # 保留这条连接，装完直接用，不用重新输密码
-                return {"kind": "missing", "backend": backend, "error": exc}
+                return {"kind": "missing", "backend": backend, "error": exc,
+                        "key": key, "conn": conn}
             except Exception:
                 backend.close()
                 raise
             return {"kind": "ok", "backend": backend, "target": target,
-                    "dep": dep, "service": svc, "views": views}
+                    "dep": dep, "service": svc, "views": views,
+                    "key": key, "conn": conn}
 
         self._async("连接", work, self._on_connected)
 
     def _on_connected(self, payload) -> None:
+        key = payload.get("key", "")
         if payload.get("kind") == "missing":
-            self._start_install_flow(payload["backend"], payload["error"])
+            self._start_install_flow(payload["backend"], payload["error"],
+                                     key, payload.get("conn") or {})
             return
 
-        self.backend = payload["backend"]
-        self.target = payload["target"]
-        self.dep = payload["dep"]
-        self.service = payload["service"]
-        views = payload["views"]
-        self.status_var.set("● 已连接")
-        self.info_var.set(self.dep.summary)
-        self._fill(views)
-        self._set_buttons()
-        self._append_log("连接成功：" + self.dep.summary)
-        for note in self.dep.notes:
+        entry = {
+            "conn": payload["conn"],
+            "backend": payload["backend"],
+            "target": payload["target"],
+            "dep": payload["dep"],
+            "service": payload["service"],
+            "views": payload["views"],
+            "label": _server_label(payload["conn"]),
+        }
+        self.servers[key] = entry
+        self._activate(key)
+        self._append_log(f"连接成功：{entry['dep'].summary}")
+        for note in entry["dep"].notes:
             self._append_log("提示：" + note)
-        if self.dep.notes:
+        if entry["dep"].notes:
             messagebox.showinfo(
                 "探测提示",
-                "检测到以下情况，请留意：\n\n• " + "\n• ".join(self.dep.notes),
+                "检测到以下情况，请留意：\n\n• " + "\n• ".join(entry["dep"].notes),
                 parent=self.root,
             )
 
+    # ------------------------------------------------------------ 多服务器
+    def _activate(self, key: str) -> None:
+        """把某台服务器切成「当前上下文」。只是换指针，不重连。"""
+        entry = self.servers.get(key)
+        if not entry:
+            return
+        self.active = key
+        self.conn = entry["conn"]
+        self.backend = entry["backend"]
+        self.target = entry["target"]
+        self.dep = entry["dep"]
+        self.service = entry["service"]
+        self.views = entry["views"]
+        self.info_var.set(entry["dep"].summary)
+        self.status_var.set("● 已连接")
+        self._fill(entry["views"])
+        self._set_buttons()
+        self._refresh_server_combo()
+
+    def _clear_active(self) -> None:
+        self.backend = self.target = self.dep = self.service = None
+        self.conn = {}
+        self.views = []
+        self.active = ""
+        self._fill([])
+        self.info_var.set("尚未连接")
+        self.status_var.set("● 未连接")
+        self._set_buttons()
+        self._refresh_server_combo()
+
+    def _close_entry(self, entry: dict) -> None:
+        try:
+            entry["backend"].close()
+        except Exception:
+            pass
+
+    def _on_server_selected(self, _event=None) -> None:
+        idx = self.server_combo.current()
+        keys = getattr(self, "_server_keys", [])
+        if 0 <= idx < len(keys):
+            self._activate(keys[idx])
+            self._append_log("已切换到 " + self.servers[keys[idx]]["label"])
+
+    def _refresh_server_combo(self) -> None:
+        self._server_keys = list(self.servers.keys())
+        labels = [self.servers[k]["label"] for k in self._server_keys] or ["（未连接）"]
+        self.server_combo["values"] = labels
+        if self.active in self._server_keys:
+            self.server_combo.current(self._server_keys.index(self.active))
+        else:
+            self.server_combo.set("（未连接）")
+
     # ---------------------------------------------------------- 一键装服务端
-    def _start_install_flow(self, backend, exc) -> None:
+    def _start_install_flow(self, backend, exc, key: str = "",
+                            conn: dict | None = None) -> None:
         self.backend = backend
+        self.conn = conn or {}
+        # 这条连接还没进 servers（探测就没通过），先把身份记下来，
+        # 装完之后 _reprobe 用它注册成一台正常服务器
+        self._pending = {"key": key or "pending", "conn": self.conn}
         self.status_var.set("● 已连接，但服务器上没有 WireGuard 服务端")
         self.info_var.set("未安装 WireGuard 服务端")
         self._set_buttons()
@@ -749,7 +837,7 @@ class App:
 
         if not getattr(exc, "installable", True):
             messagebox.showwarning("无法继续", str(exc), parent=self.root)
-            self.disconnect()
+            self._abort_install(backend)
             return
 
         host = (self.conn or {}).get("endpoint_host") or (self.conn or {}).get("host", "")
@@ -762,11 +850,24 @@ class App:
             self.root.wait_window(dlg.top)
             if not dlg.result:
                 self._append_log("已取消安装")
-                self.disconnect()
+                self._abort_install(backend)
                 return
             self._run_install(plan, dlg.result)
 
         self._async("检查安装环境", work, done)
+
+    def _abort_install(self, backend) -> None:
+        """安装流程中止：这条连接还没进 servers，得单独关掉，别泄漏会话。"""
+        try:
+            backend.close()
+        except Exception:
+            pass
+        self.backend = None
+        self._pending = {}
+        if self.servers:
+            self._activate(next(reversed(self.servers)))
+        else:
+            self._clear_active()
 
     def _run_install(self, plan, options) -> None:
         backend = self.backend
@@ -796,32 +897,38 @@ class App:
         """安装完重新走一遍探测，成功后就是正常的已连接状态。"""
         backend = self.backend
         conn = self.conn or {}
+        pending = getattr(self, "_pending", {}) or {}
 
         def work():
             target, dep = probe(backend, conn, self._log)
             svc = WGService(target, dep, self._log, history=self.history)
             return {"kind": "ok", "backend": backend, "target": target,
-                    "dep": dep, "service": svc, "views": svc.list_peers()}
+                    "dep": dep, "service": svc, "views": svc.list_peers(),
+                    "key": pending.get("key", ""),
+                    "conn": pending.get("conn") or conn}
 
         self._async("重新探测", work, self._on_connected)
 
     def disconnect(self) -> None:
-        if self.backend:
-            try:
-                self.backend.close()
-            except Exception:
-                pass
-        self.backend = self.target = self.dep = self.service = None
-        self.views = []
-        self._fill([])
-        self.info_var.set("尚未连接")
-        self.status_var.set("● 未连接")
-        self._set_buttons()
-        self._append_log("已断开连接")
+        """断开当前这台。还有别的连着就自动切过去，否则回到未连接状态。"""
+        if not self.active:
+            return
+        entry = self.servers.pop(self.active, None)
+        label = entry["label"] if entry else ""
+        if entry:
+            self._close_entry(entry)
+        self._append_log(f"已断开 {label}")
+        if self.servers:
+            self._activate(next(reversed(self.servers)))
+        else:
+            self._clear_active()
 
     # ---------------------------------------------------------------- 列表
     def _fill(self, views) -> None:
         self.views = views or []
+        # 同步回这台服务器自己的槽位，否则切走再切回来还是旧的列表
+        if self.active and self.active in self.servers:
+            self.servers[self.active]["views"] = self.views
         for item in self.tree.get_children():
             self.tree.delete(item)
         self.row_keys.clear()
@@ -1190,11 +1297,16 @@ class App:
         self._on_auth_change()
 
     def _on_close(self) -> None:
-        try:
-            if self.backend:
+        for entry in list(self.servers.values()):
+            self._close_entry(entry)
+        # 安装流程里那条连接还没注册进 servers，单独关一次
+        if self.backend and self.backend not in [
+            e["backend"] for e in self.servers.values()
+        ]:
+            try:
                 self.backend.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
         self.root.destroy()
 
     def run(self) -> None:
