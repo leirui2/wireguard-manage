@@ -39,17 +39,20 @@ def stamp(version: str) -> str:
     init.write_text(new_text, encoding="utf-8", newline="\n")
 
     quad = ", ".join((version.split(".") + ["0", "0", "0"])[:4])
+    # PE 的 FileVersion 只接受 4 段数字。三段号（1.0.16）补成 1.0.16.0；
+    # 四段号（CI 出的 1.0.16.14）必须原样用，再补一个 .0 就成 5 段，PyInstaller 会报错。
+    file_ver = version if len(version.split(".")) >= 4 else version + ".0"
     info = ROOT / "build_assets" / "version_info.txt"
     info_text = info.read_text(encoding="utf-8")
     info_text = re.sub(r"filevers=\([^)]*\)", f"filevers=({quad})", info_text)
     info_text = re.sub(r"prodvers=\([^)]*\)", f"prodvers=({quad})", info_text)
     info_text = re.sub(
         r"StringStruct\('FileVersion', '[^']*'\)",
-        f"StringStruct('FileVersion', '{version}.0')", info_text,
+        f"StringStruct('FileVersion', '{file_ver}')", info_text,
     )
     info_text = re.sub(
         r"StringStruct\('ProductVersion', '[^']*'\)",
-        f"StringStruct('ProductVersion', '{version}.0')", info_text,
+        f"StringStruct('ProductVersion', '{file_ver}')", info_text,
     )
     info.write_text(info_text, encoding="utf-8", newline="\n")
 

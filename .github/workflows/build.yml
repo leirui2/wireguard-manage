@@ -42,15 +42,23 @@ jobs:
       - name: Verify tkinter is available
         run: python -c "import tkinter; print('tkinter', tkinter.TkVersion)"
 
-      # 版本号必须注入到源码里，否则 exe 里的 __version__ 永远是 1.0.0，
+      # 版本号必须注入到源码里，否则 exe 里的 __version__ 永远是旧值，
       # 「检查更新」会把线上每一次构建都当成新版本，天天提示升级。
+      #
+      # 规则：基线取自源码里的 __version__（开发者手动维护），后面追加构建号。
+      # 本地打包出来是 1.0.16，CI 出来是 1.0.16.14 —— 四段号恒大于三段号，
+      # 两边编号体系不同也不会再出现"线上版本比本地还小"的倒挂。
       - name: Stamp version
         shell: pwsh
         run: |
           if ($env:GITHUB_REF -like "refs/tags/v*") {
             $ver = $env:GITHUB_REF_NAME.TrimStart("v")
           } else {
-            $ver = "1.0.${{ github.run_number }}"
+            $line = Select-String -Path wgmanager/__init__.py -Pattern '__version__\s*=\s*"([\d.]+)"'
+            if (-not $line) { throw "wgmanager/__init__.py 里找不到 __version__" }
+            # 只取前三段，防止源码里残留四段号被越加越长
+            $base = ($line.Matches[0].Groups[1].Value -split '\.')[0..2] -join '.'
+            $ver = "$base.${{ github.run_number }}"
           }
           Write-Host "Stamped version: $ver"
           python build_assets/stamp_version.py $ver
