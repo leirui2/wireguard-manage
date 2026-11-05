@@ -18,12 +18,14 @@ from .config import WGConfig
 from .probe import Deployment
 from .util import (
     allocate_addresses,
+    expire_status,
     gen_keypair,
     gen_psk,
     host_addresses,
     human_bytes,
     human_handshake,
     normalize_allowed_ips,
+    parse_expire_date,
     split_networks,
     stamp,
 )
@@ -50,6 +52,14 @@ def _table(out: str) -> dict[str, list[str]]:
     return rows
 
 
+def _to_int(value) -> int:
+    """wg show 的输出偶尔带单位或空串，解析不出来就当 0。"""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 @dataclass
 class PeerView:
     pubkey: str = ""
@@ -64,6 +74,14 @@ class PeerView:
     endpoint: str = "-"
     online: bool = False
     has_psk: bool = False
+    # 原始累计值（字节），画流量趋势要用；traffic 是给人看的格式化字符串
+    rx: int = 0
+    tx: int = 0
+    # 有效期：WireGuard 协议本身没有这个概念，是本工具记在注释里的约定
+    expire: str = ""
+    expire_text: str = ""
+    expire_days: int | None = None
+    expired: bool = False
 
 
 @dataclass
@@ -76,6 +94,7 @@ class AddResult:
     backup: str
     reload_msg: str
     note: str = ""
+    expire: str = ""
 
 
 @dataclass
@@ -166,12 +185,14 @@ class WGService:
         conf = self.refresh_conf()
         handshakes, transfers, endpoints = self.runtime()
         now = time.time()
+        today = dt.date.today()
         views = []
         for peer in conf.peers():
             hs = handshakes.get(peer.public_key, ["0"])
             tr = transfers.get(peer.public_key, [])
             ep = endpoints.get(peer.public_key, [])
             htext, online = human_handshake(hs[0] if hs else 0, now)
+            etext, edays = expire_status(peer.expire, today)
             traffic = (
                 f"↓{human_bytes(tr[0])} / ↑{human_bytes(tr[1])}"
                 if len(tr) >= 2
@@ -191,6 +212,12 @@ class WGService:
                     endpoint=(ep[0] if ep and ep[0] != "(none)" else "-"),
                     online=online,
                     has_psk=bool(peer.preshared_key),
+                    rx=_to_int(tr[0]) if len(tr) >= 2 else 0,
+                    tx=_to_int(tr[1]) if len(tr) >= 2 else 0,
+                    expire=peer.expire,
+                    expire_text=etext,
+                    expire_days=edays,
+                    expired=(edays is not None and edays < 0),
                 )
             )
         return views
@@ -206,6 +233,7 @@ class WGService:
         endpoint: str | None = None,
         use_psk: bool | None = None,
         vpn_addresses: str = "",
+        expire: str = "",
     ) -> AddResult:
         name = (name or "").strip()
         if not name:
@@ -227,6 +255,9 @@ class WGService:
                 self.dep.addresses, [p.allowed_ips for p in existing]
             )
         created = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        expire = (expire or "").strip()
+        if expire and not parse_expire_date(expire):
+            raise ValueError("有效期格式不对，应写成 2026-11-12")
         conf.add_peer(
             public_key=pub,
             allowed_ips=", ".join(addresses),
@@ -234,6 +265,7 @@ class WGService:
             name=name,
             note=note,
             created=created,
+            expire=expire,
         )
 
         default_endpoint = f"{self.dep.endpoint_host}:{self.dep.listen_port}"
@@ -261,6 +293,7 @@ class WGService:
             backup=applied.backup,
             reload_msg=applied.reload_msg,
             note=note,
+            expire=expire,
         )
 
     # ------------------------------------------------------------------ 修改
@@ -271,11 +304,13 @@ class WGService:
         name: str | None = None,
         note: str | None = None,
         allowed_ips: str | None = None,
+        expire: str | None = None,
     ) -> UpdateResult:
-        """修改已有密钥的名称 / 备注 / VPN 地址。
+        """修改已有密钥的名称 / 备注 / VPN 地址 / 有效期。
 
-        传 None 表示该项不动。改名称和备注只动注释，对运行中的隧道没有任何影响；
-        改 VPN 地址会变更服务端分配，客户端必须同步改 Address 后才能重连。
+        传 None 表示该项不动。改名称、备注、有效期只动注释，
+        对运行中的隧道没有任何影响；改 VPN 地址会变更服务端分配，
+        客户端必须同步改 Address 后才能重连。
         """
         conf = self.refresh_conf()
         peers = conf.peers()
@@ -309,6 +344,14 @@ class WGService:
                 self._check_address_available(peers, pubkey, new_allowed)
                 changed.append("VPN 地址")
 
+        new_expire = None
+        if expire is not None:
+            new_expire = (expire or "").strip()
+            if new_expire and not parse_expire_date(new_expire):
+                raise ValueError("有效期格式不对，应写成 2026-11-12")
+            if new_expire != (peer.expire or ""):
+                changed.append("有效期")
+
         final_name = new_name if new_name is not None else (peer.raw_name or "")
         result = UpdateResult(
             name=final_name or f"未命名 ({pubkey[:8]})",
@@ -335,7 +378,8 @@ class WGService:
                 + " 后重新连接"
             )
 
-        conf.update_peer(peer, name=new_name, note=new_note, allowed_ips=new_allowed)
+        conf.update_peer(peer, name=new_name, note=new_note,
+                         allowed_ips=new_allowed, expire=new_expire)
         applied = self._apply(conf.render(), expect_present={pubkey}, expect_absent=set(),
                               action="修改密钥",
                               summary=f"{result.name}：{'、'.join(changed)}")
@@ -412,6 +456,45 @@ class WGService:
             summary="、".join(names),
         )
         self.log(f"已删除 {len(matched)} 个密钥：{', '.join(names)}")
+        return names
+
+    # ------------------------------------------------------------ 过期清理
+    @staticmethod
+    def _pick_expired(conf) -> list:
+        """挑出已过期的 peer。只读，不碰服务器。"""
+        today = dt.date.today()
+        out = []
+        for peer in conf.peers():
+            target = parse_expire_date(peer.expire)
+            if target is not None and target < today:
+                out.append(peer)
+        return out
+
+    def expired_peers(self) -> list:
+        return self._pick_expired(self.refresh_conf())
+
+    def remove_expired(self) -> list[str]:
+        """清理所有已过期的密钥。
+
+        走的是和普通删除完全相同的链路（备份 → 替换 → 热加载 → 校验 → 失败回滚），
+        所以误清理也能从配置历史里还原回来。
+        """
+        conf = self.refresh_conf()
+        matched = self._pick_expired(conf)
+        if not matched:
+            self.log("没有已过期的密钥")
+            return []
+        names = [p.display_name for p in matched]
+        for peer in sorted(matched, key=lambda p: p.block_start, reverse=True):
+            conf.remove_peer(peer)
+        self._apply(
+            conf.render(),
+            expect_present=set(),
+            expect_absent={p.public_key for p in matched},
+            action="清理过期密钥",
+            summary="、".join(names),
+        )
+        self.log(f"已清理 {len(matched)} 个过期密钥：{', '.join(names)}")
         return names
 
     # ------------------------------------------------------------------ 还原

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 HEADER_RE = re.compile(r"^\s*\[\s*([^\]]+?)\s*\]\s*(?:[#;].*)?$")
 KV_RE = re.compile(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$")
-META_RE = re.compile(r"^#\s*WGM_(NAME|NOTE|CREATED)\s*:\s*(.*)$", re.IGNORECASE)
+META_RE = re.compile(r"^#\s*WGM_(NAME|NOTE|CREATED|EXPIRE)\s*:\s*(.*)$", re.IGNORECASE)
 FOREIGN_NAME_RE = re.compile(
     r"^#{1,3}\s*(?:BEGIN_PEER|Client|Name|Peer)\s*[:=]?\s*(.+)$", re.IGNORECASE
 )
@@ -30,6 +30,9 @@ class Peer:
     name: str = ""
     note: str = ""
     created: str = ""
+    # 有效期（YYYY-MM-DD）。WireGuard 协议本身没有过期概念，
+    # 这只是本工具记在注释里的备忘，靠界面去检查和清理。
+    expire: str = ""
     raw_name: str = ""          # 元数据里确实写了名字
     block_start: int = -1       # 含上方备注注释
     header_index: int = -1
@@ -110,7 +113,7 @@ class WGConfig:
 
     @staticmethod
     def _parse_meta(comment_lines: list[str]) -> dict:
-        meta = {"name": "", "note": "", "created": ""}
+        meta = {"name": "", "note": "", "created": "", "expire": ""}
         for line in comment_lines:
             stripped = line.strip()
             m = META_RE.match(stripped)
@@ -142,6 +145,7 @@ class WGConfig:
                 raw_name=meta["name"],
                 note=meta["note"],
                 created=meta["created"],
+                expire=meta["expire"],
                 block_start=block_start,
                 header_index=start,
                 block_end=end,
@@ -158,6 +162,7 @@ class WGConfig:
         name: str = "",
         note: str = "",
         created: str = "",
+        expire: str = "",
         persistent_keepalive: str = "",
         endpoint: str = "",
     ) -> None:
@@ -165,6 +170,10 @@ class WGConfig:
             f"# WGM_NAME: {name or '未命名'}",
             f"# WGM_NOTE: {note or ''}",
             f"# WGM_CREATED: {created or ''}",
+        ]
+        if expire:
+            lines.append(f"# WGM_EXPIRE: {expire}")
+        lines += [
             "[Peer]",
             f"PublicKey = {public_key}",
         ]
@@ -188,8 +197,9 @@ class WGConfig:
         name: str | None = None,
         note: str | None = None,
         allowed_ips: str | None = None,
+        expire: str | None = None,
     ) -> None:
-        """就地修改一个已存在 Peer 的名称 / 备注 / AllowedIPs。
+        """就地修改一个已存在 Peer 的名称 / 备注 / AllowedIPs / 有效期。
 
         只动目标行：名称和备注写成 `# WGM_*` 注释挂在 [Peer] 上方，
         AllowedIPs 只替换 Key 值相同的行；其余字段与注释逐字保留。
@@ -200,7 +210,7 @@ class WGConfig:
         if allowed_ips is not None:
             self._set_peer_field(peer, "AllowedIPs", allowed_ips)
 
-        if name is not None or note is not None:
+        if name is not None or note is not None or expire is not None:
             current = {}
             for line in self.lines[peer.block_start : peer.header_index]:
                 m = META_RE.match(line.strip())
@@ -210,7 +220,10 @@ class WGConfig:
                 current.get("name") or peer.raw_name or ""
             )
             final_note = note if note is not None else current.get("note", peer.note)
-            self._set_meta(peer, final_name, final_note, current.get("created", peer.created))
+            final_expire = (expire if expire is not None
+                            else current.get("expire", peer.expire))
+            self._set_meta(peer, final_name, final_note,
+                           current.get("created", peer.created), final_expire)
 
     def _set_peer_field(self, peer: Peer, key: str, value: str) -> None:
         lower = key.lower()
@@ -228,7 +241,8 @@ class WGConfig:
         self.lines.insert(at, f"{key} = {value}")
         peer.block_end += 1
 
-    def _set_meta(self, peer: Peer, name: str, note: str, created: str) -> None:
+    def _set_meta(self, peer: Peer, name: str, note: str, created: str,
+                  expire: str = "") -> None:
         """重建 [Peer] 上方的 WGM 注释块，保留其它注释（如一键脚本的 ### Client xxx）。"""
         start, header = peer.block_start, peer.header_index
         block = self.lines[start:header]
@@ -244,6 +258,8 @@ class WGConfig:
         ]
         if created:
             new_block.append(f"# WGM_CREATED: {created}")
+        if expire:
+            new_block.append(f"# WGM_EXPIRE: {expire}")
 
         delta = len(new_block) - len(block)
         self.lines[start:header] = new_block

@@ -2,3 +2,5 @@ paramiko==5.1.0
 segno==1.6.6
 # 分发卡片要把二维码和文字画在同一张图上，只能用 Pillow 渲染字体
 Pillow==13.0.0
+# 系统托盘。Windows 后端走纯 ctypes，不依赖 pywin32；图标用 Pillow 现画
+pystray==0.19.5

@@ -275,6 +275,38 @@ def human_handshake(ts, now: float | None = None) -> tuple[str, bool]:
     return text, delta <= 300
 
 
+def parse_expire_date(text) -> dt.date | None:
+    """解析 `2026-11-12` 这类日期。写法不标准就当没设有效期。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d"):
+        try:
+            return dt.datetime.strptime(raw[:10], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def expire_status(text, today: dt.date | None = None) -> tuple[str, int | None]:
+    """返回 (列表里显示的短文本, 距到期天数)。
+
+    天数为负表示已过期多少天；没有有效期时两者分别是空串和 None。
+    """
+    target = parse_expire_date(text)
+    if target is None:
+        return "", None
+    today = today or dt.date.today()
+    days = (target - today).days
+    if days < 0:
+        return "已过期", days
+    if days == 0:
+        return "今天到期", 0
+    if days <= 3:
+        return f"{days} 天后", days
+    return f"还剩 {days} 天", days
+
+
 def stamp() -> str:
     return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 

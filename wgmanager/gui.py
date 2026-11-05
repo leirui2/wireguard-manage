@@ -6,17 +6,22 @@
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import ipaddress
 import json
 import os
 import queue
 import sys
 import threading
+import time
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from . import __version__
+from . import autostart as autostart_mod
+from . import tray as tray_mod
+from .audit import ACTION_LABELS, AuditLog, export_csv
 from .backend import make_backend
 from .downloads import CLIENTS, OFFICIAL_INSTALL_PAGE, open_url
 from .history import History
@@ -26,6 +31,8 @@ from .probe import ProbeError, ServerMissing, probe
 from .secrets import available as sealed_available
 from .secrets import is_sealed, protect, unprotect
 from .service import WGService
+from .settings import Settings
+from .traffic import TrafficStore, human_rate, nice_rate_ceiling
 from .updater import (
     RELEASES_PAGE,
     Latest,
@@ -42,12 +49,16 @@ from .updater import (
 )
 from .util import (
     normalize_allowed_ips,
+    parse_expire_date,
     patch_client_conf,
     qr_png,
     safe_filename,
     stamp,
 )
 from .vault import Vault
+
+# 动作下拉里显示中文，查询时再换回内部 key
+_ACTION_BY_LABEL = {v: k for k, v in ACTION_LABELS.items()}
 
 
 def app_dir() -> str:
@@ -186,7 +197,7 @@ class App:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title(f"WireGuard 密钥管理工具  v{__version__}")
-        self.root.geometry("1240x760")
+        self.root.geometry("1270x760")
         self.root.minsize(1060, 680)
         _setup_fonts(self.root)
 
@@ -214,17 +225,43 @@ class App:
         self.vault = Vault(APP_DIR)
         # 本地配置历史：每次改动前存一份原样，可预览、可还原
         self.history = History(APP_DIR)
+        # 操作审计：每次写操作记一行，只记公钥不记私钥
+        self.audit = AuditLog(APP_DIR)
+        # 界面偏好（托盘 / 自启 / 刷新间隔），和连接凭据分开存
+        self.settings = Settings(APP_DIR)
+        # 流量采样：wg show transfer 是累计值，存下来才能算速率画趋势
+        self.traffic = TrafficStore(APP_DIR)
+        self._last_sample = 0.0
+        # 系统托盘：pystray 跑在子线程，菜单回调经 root.after 编组回主线程
+        self.tray = None
+        self._tray_hint_shown = False
+        # 在线状态监控：定时轮询当前服务器，只在状态翻转时提示。
+        # 不走 _async —— 那条路会把界面锁住（busy），每分钟锁一次没法用。
+        self.monitor_var = tk.BooleanVar(
+            value=bool(self.settings.get("monitor_enabled", True)))
+        self._monitor_job = None
+        self._monitor_running = False
+        self._monitor_started = 0.0
+        self.monitor_interval = max(
+            10, int(self.settings.get("monitor_interval", 60))) * 1000
+        # paramiko 的 Transport 不适合并发跑命令：监控线程和用户操作
+        # 同时发 exec_command 有概率互相踩，用一把锁串起来
+        self._ssh_lock = threading.Lock()
 
+        self._poll_job = None
         self._build()
-        self.root.after(120, self._poll)
+        self._poll_job = self.root.after(120, self._poll)
+        self._monitor_job = self.root.after(3000, self._monitor_tick)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self.settings.get("tray_enabled", True) and tray_mod.available():
+            self.root.after(800, self._start_tray_if_enabled)
         self._log("就绪。填好服务器信息后点「连接」；也可以直接勾选「演示模式」先试用。")
         self._refresh_profile_combo()
         self._refresh_server_combo()
         # 按内容实际需要的尺寸开窗，并限制在屏幕内，避免新增控件被裁切
         self.root.update_idletasks()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        width = min(max(1240, self.root.winfo_reqwidth() + 12), int(sw * 0.94))
+        width = min(max(1270, self.root.winfo_reqwidth() + 12), int(sw * 0.94))
         height = min(max(720, self.root.winfo_reqheight() + 12), int(sh * 0.90))
         center_window(self.root, width, height)
         self._check_pending_update()
@@ -276,6 +313,12 @@ class App:
         self.update_hint.pack(side="left", padx=10)
         ttk.Button(bar, text="发行版页面", width=12,
                    command=lambda: open_url(RELEASES_PAGE)).pack(side="right")
+        self.monitor_check = ttk.Checkbutton(
+            bar, text="自动刷新在线状态", variable=self.monitor_var,
+            command=self._on_monitor_toggle)
+        self.monitor_check.pack(side="right", padx=(0, 14))
+        ttk.Button(bar, text="设置", width=8,
+                   command=self.show_settings).pack(side="right", padx=(0, 6))
 
     def _build_connection(self, frame) -> None:
         frame.pack(fill="x", padx=12, pady=(10, 8))
@@ -394,15 +437,18 @@ class App:
         self.refresh_btn = ttk.Button(bar, text="刷新", width=10, command=self.refresh,
                                       state="disabled")
         self.refresh_btn.pack(side="right", padx=4)
-        self.clients_btn = ttk.Button(bar, text="配置目录", width=11,
+        self.clients_btn = ttk.Button(bar, text="目录", width=6,
                                       command=self._open_clients_dir)
         self.clients_btn.pack(side="right", padx=4)
-        self.history_btn = ttk.Button(bar, text="配置历史", width=11,
+        self.history_btn = ttk.Button(bar, text="历史", width=8,
                                       command=self.show_history, state="disabled")
         self.history_btn.pack(side="right", padx=4)
         self.client_btn = ttk.Button(bar, text="客户端配置", width=13,
                                      command=self.show_client_conf, state="disabled")
         self.client_btn.pack(side="right", padx=4)
+        self.traffic_btn = ttk.Button(bar, text="流量", width=8,
+                                      command=self.show_traffic, state="disabled")
+        self.traffic_btn.pack(side="right", padx=4)
         self.delete_btn = ttk.Button(bar, text="删除", width=8,
                                      command=self.delete_selected, state="disabled")
         self.delete_btn.pack(side="right", padx=4)
@@ -414,23 +460,39 @@ class App:
                                   state="disabled")
         self.add_btn.pack(side="right", padx=4)
 
-        columns = ("name", "note", "pubkey", "address", "handshake", "traffic", "endpoint", "status")
+        columns = ("name", "note", "pubkey", "address", "expire", "handshake",
+                   "traffic", "endpoint", "status")
         headers = {
-            "name": ("名称", 160), "note": ("备注", 150), "pubkey": ("公钥", 140),
-            "address": ("VPN 地址", 175), "handshake": ("最近握手", 110),
-            "traffic": ("流量 (收/发)", 140), "endpoint": ("来源端点", 145),
+            "name": ("名称", 150), "note": ("备注", 130), "pubkey": ("公钥", 120),
+            "address": ("VPN 地址", 165), "expire": ("到期", 92),
+            "handshake": ("最近握手", 105),
+            "traffic": ("流量 (收/发)", 130), "endpoint": ("来源端点", 130),
             "status": ("状态", 70),
         }
+        # 过期提示条：平时不占地方，检测到过期/临期才出现
+        self.expire_bar = ttk.Frame(frame)
+        self.expire_label = ttk.Label(self.expire_bar, text="", foreground="#b03030")
+        self.expire_label.pack(side="left")
+        self.clean_btn = ttk.Button(self.expire_bar, text="清理过期", width=11,
+                                    command=self.clean_expired, state="disabled")
+        self.clean_btn.pack(side="left", padx=(10, 0))
+        self.auto_clean_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self.expire_bar, text="连上时自动清理（仍会确认）",
+                        variable=self.auto_clean_var).pack(side="left", padx=(14, 0))
+
         body = ttk.Frame(frame)
         body.pack(fill="both", expand=True)
+        self.tree_body = body
         self.tree = ttk.Treeview(body, columns=columns, show="headings", selectmode="extended")
         for col in columns:
             title, width = headers[col]
             self.tree.heading(col, text=title)
-            self.tree.column(col, width=width, minwidth=70,
-                             anchor="w" if col not in ("status",) else "center")
+            self.tree.column(col, width=width, minwidth=60,
+                             anchor="w" if col not in ("status", "expire") else "center")
         self.tree.tag_configure("online", foreground="#0a7a3d")
         self.tree.tag_configure("offline", foreground="#777777")
+        self.tree.tag_configure("expired", foreground="#b03030")
+        self.tree.tag_configure("expiring", foreground="#a05a00")
         vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(body, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -451,6 +513,20 @@ class App:
     # ------------------------------------------------------------------ 工具
     def _log(self, msg: str) -> None:
         self.queue.put(("log", str(msg)))
+
+    @staticmethod
+    def _entry_host(conn: dict) -> str:
+        """服务器标识：宿主、端口、账号，能区分同一 IP 的不同身份。"""
+        conn = conn or {}
+        if conn.get("demo"):
+            return "演示模式"
+        if not conn.get("host"):
+            return ""
+        return f"{conn.get('host')}:{conn.get('port', 22)}/{conn.get('username', '')}"
+
+    def _audit_host(self) -> str:
+        """审计日志里的服务器标识，取当前这台。"""
+        return self._entry_host(self.conn)
 
     def _append_log(self, msg: str) -> None:
         import datetime
@@ -484,6 +560,14 @@ class App:
                     self.status_var.set(f"● {label}失败")
                     self._append_log(tb.strip())
                     messagebox.showerror(label + "失败", str(exc), parent=self.root)
+                elif kind == "monitor_ok":
+                    key, views = payload
+                    self._on_monitor_result(key, views)
+                elif kind == "monitor_err":
+                    self._monitor_running = False
+                    key, exc = payload
+                    # 监控失败不弹窗：网络抖一下就弹一次，会把人心态搞崩
+                    self._append_log(f"自动刷新失败（{key}）：{exc}")
                 elif kind == "update_ok":
                     self._on_update_info(payload)
                 elif kind == "update_fail":
@@ -498,7 +582,7 @@ class App:
                     self._on_download_failed(latest, exc)
         except queue.Empty:
             pass
-        self.root.after(120, self._poll)
+        self._poll_job = self.root.after(120, self._poll)
 
     def _async(self, label: str, work, done) -> None:
         if self.busy:
@@ -509,7 +593,8 @@ class App:
 
         def runner():
             try:
-                result = work()
+                with self._ssh_lock:
+                    result = work()
             except Exception as exc:
                 self.queue.put(("error", (label, exc, traceback.format_exc())))
             else:
@@ -669,7 +754,8 @@ class App:
         connected = self.service is not None
         enabled = connected and not self.busy
         for btn in (self.refresh_btn, self.add_btn, self.edit_btn,
-                    self.delete_btn, self.client_btn, self.history_btn):
+                    self.delete_btn, self.client_btn, self.history_btn,
+                    self.traffic_btn):
             btn.configure(state="normal" if enabled else "disabled")
         # 多服务器下「连接」不再受"已连着一台"限制：随时可以连新的，
         # 只有正在连的时候才临时禁用，避免重复发起。
@@ -774,6 +860,10 @@ class App:
                 "检测到以下情况，请留意：\n\n• " + "\n• ".join(entry["dep"].notes),
                 parent=self.root,
             )
+        # 勾了自动清理就顺手处理掉过期的。clean_expired 自带确认框，
+        # 不会静默删东西 —— 删密钥这种操作不该只看一个复选框就执行。
+        if self.auto_clean_var.get() and any(v.expired for v in entry["views"]):
+            self.root.after(700, self.clean_expired)
 
     # ------------------------------------------------------------ 多服务器
     def _activate(self, key: str) -> None:
@@ -793,6 +883,9 @@ class App:
         self._fill(entry["views"])
         self._set_buttons()
         self._refresh_server_combo()
+        # 切回来的这台可能已经几十分钟没刷过了，立刻查一次
+        if self.monitor_var.get():
+            self._schedule_monitor(delay=400)
 
     def _clear_active(self) -> None:
         self.backend = self.target = self.dep = self.service = None
@@ -935,6 +1028,10 @@ class App:
             if res.warnings:
                 text += "\n\n注意：\n• " + "\n• ".join(res.warnings)
             messagebox.showinfo("安装完成", text, parent=self.root)
+            self.audit.record(
+                "install", host=self._audit_host(),
+                detail=f"接口 {res.iface}，配置 {res.conf_path}",
+            )
             self._reprobe()
 
         self._async("安装 WireGuard 服务端", work, done)
@@ -983,14 +1080,194 @@ class App:
                 "", "end",
                 values=(
                     view.name, view.note, view.pubkey[:14] + "…", view.address,
+                    view.expire_text or "—",
                     view.handshake, view.traffic, view.endpoint,
                     "在线" if view.online else "离线/从未",
                 ),
-                tags=("online" if view.online else "offline",),
+                tags=(self._row_tag(view),),
             )
             self.row_keys[iid] = view.pubkey
         online = sum(1 for v in self.views if v.online)
         self.count_var.set(f"共 {len(self.views)} 个密钥（在线 {online}）")
+        self._update_expire_bar(self.views)
+        self._update_tray_state(self.views)
+
+    @staticmethod
+    def _row_tag(view) -> str:
+        """过期最要紧，其次是临期，然后再看在线状态。"""
+        if view.expired:
+            return "expired"
+        if view.expire_days is not None and view.expire_days <= 3:
+            return "expiring"
+        return "online" if view.online else "offline"
+
+    def _update_expire_bar(self, views) -> None:
+        expired = [v for v in views if v.expired]
+        soon = [v for v in views
+                if not v.expired and v.expire_days is not None and v.expire_days <= 3]
+        if not expired and not soon:
+            if self.expire_bar.winfo_manager():
+                self.expire_bar.pack_forget()
+            return
+        parts = []
+        if expired:
+            parts.append(f"{len(expired)} 个密钥已过期")
+        if soon:
+            parts.append(f"{len(soon)} 个 3 天内到期")
+        self.expire_label.configure(text=" · ".join(parts))
+        self.clean_btn.configure(state="normal" if expired else "disabled")
+        if not self.expire_bar.winfo_manager():
+            self.expire_bar.pack(fill="x", pady=(0, 6), before=self.tree_body)
+
+    def clean_expired(self) -> None:
+        if not self.service:
+            return
+        targets = [v for v in self.views if v.expired]
+        if not targets:
+            return
+        listing = "\n".join(f"· {v.name}（{v.address or '-'}）" for v in targets[:15])
+        if len(targets) > 15:
+            listing += f"\n… 还有 {len(targets) - 15} 个"
+        if not messagebox.askyesno(
+            "清理过期密钥",
+            f"从服务器上删除这 {len(targets)} 个已过期的密钥？\n\n{listing}\n\n"
+            "删除前会自动备份，删错了可以从「历史记录」里还原。",
+            icon="warning", parent=self.root,
+        ):
+            return
+
+        def done(names):
+            for v in targets:
+                self.vault.drop(v.pubkey)
+                self.audit.record("expire", host=self._audit_host(), name=v.name,
+                                  pubkey=v.pubkey, detail=f"到期日 {v.expire}")
+            self._append_log("已清理过期密钥：" + "、".join(names))
+            self.refresh()
+
+        self._async("清理过期密钥", self.service.remove_expired, done)
+
+    # ------------------------------------------------------ 在线状态监控
+    def _on_monitor_toggle(self) -> None:
+        if self.monitor_var.get():
+            self._append_log(
+                f"已开启自动刷新：每 {self.monitor_interval // 1000} 秒查一次当前服务器")
+            self._schedule_monitor(delay=800)
+        else:
+            self._cancel_monitor()
+            self._append_log("已关闭自动刷新，点「刷新」手动更新")
+
+    def _schedule_monitor(self, delay: int | None = None) -> None:
+        self._cancel_monitor()
+        self._monitor_job = self.root.after(
+            self.monitor_interval if delay is None else delay, self._monitor_tick)
+
+    def _cancel_monitor(self) -> None:
+        if self._monitor_job is not None:
+            try:
+                self.root.after_cancel(self._monitor_job)
+            except Exception:
+                pass
+            self._monitor_job = None
+
+    def _monitor_tick(self) -> None:
+        self._monitor_job = None
+        if not self.monitor_var.get():
+            return
+        svc, key = self.service, self.active
+        # 上一轮还没回来（SSH 卡住），但别让监控就此永久停摆
+        if (self._monitor_running
+                and time.monotonic() - self._monitor_started > 180):
+            self._monitor_running = False
+        # 有别的事在跑就不插队：一次 list_peers 要 SSH 往返，
+        # 跟写配置挤一块容易撞上超时
+        if svc is None or self.busy or self._monitor_running:
+            self._schedule_monitor()
+            return
+        self._monitor_running = True
+        self._monitor_started = time.monotonic()
+
+        def runner():
+            try:
+                with self._ssh_lock:
+                    views = svc.list_peers()
+            except Exception as exc:
+                self.queue.put(("monitor_err", (key, exc)))
+            else:
+                self.queue.put(("monitor_ok", (key, views)))
+
+        threading.Thread(target=runner, daemon=True).start()
+        self._schedule_monitor()
+
+    def _on_monitor_result(self, key: str, views) -> None:
+        self._monitor_running = False
+        entry = self.servers.get(key)
+        if entry is None:
+            return
+        prev = {v.pubkey: v.online for v in (entry.get("views") or [])}
+        entry["views"] = views
+        if key == self.active:
+            self.views = views
+            self._refresh_live_cells(views)
+        self._note_transitions(entry.get("label", key), prev, views)
+        self._sample_traffic(entry, views)
+
+    def _sample_traffic(self, entry: dict, views) -> None:
+        """把这一轮的累计流量存下来。
+
+        轮询一分钟一次，但采样五分钟一次就够 —— 图上点太密看不出东西，
+        库还能小到 1/5。这里用独立节流，不跟着轮询频率走。
+        """
+        now = time.time()
+        if now - self._last_sample < 300:
+            return
+        self._last_sample = now
+        points = [(v.pubkey, v.rx, v.tx) for v in views if v.rx or v.tx]
+        if not points:
+            return
+        self.traffic.record(self._entry_host(entry.get("conn") or {}), points, now)
+
+    def _note_transitions(self, label: str, prev: dict, views) -> None:
+        """只在状态翻转时说话 —— 每分钟把所有人报一遍没人受得了。"""
+        if not prev:
+            return  # 第一轮没有基线，不能把所有人都当成"刚上线"
+        for v in views:
+            if v.pubkey not in prev:
+                self._append_log(f"{label} 上多了一个密钥：{v.name}")
+                continue
+            was = prev[v.pubkey]
+            if was and not v.online:
+                self._append_log(f"「{v.name}」离线了（最后握手：{v.handshake}）")
+            elif not was and v.online:
+                self._append_log(f"「{v.name}」上线了")
+
+    def _refresh_live_cells(self, views) -> None:
+        """就地改几列，不重建列表 —— 重建会打断选中和滚动位置。"""
+        items = self.tree.get_children()
+        if len(items) != len(views):
+            self._fill(views)  # 数量对不上，说明有人增删了，老实重建
+            return
+        by_key = {v.pubkey: v for v in views}
+        for iid in items:
+            v = by_key.get(self.row_keys.get(iid, ""))
+            if v is None:
+                self._fill(views)
+                return
+            for col, val in (
+                ("handshake", v.handshake), ("traffic", v.traffic),
+                ("endpoint", v.endpoint),
+                ("expire", v.expire_text or "—"),
+                ("status", "在线" if v.online else "离线/从未"),
+            ):
+                if str(self.tree.set(iid, col)) != str(val):
+                    self.tree.set(iid, col, val)
+            want = self._row_tag(v)
+            cur = self.tree.item(iid, "tags")
+            if not cur or cur[0] != want:
+                self.tree.item(iid, tags=(want,))
+        online = sum(1 for v in views if v.online)
+        self.count_var.set(f"共 {len(views)} 个密钥（在线 {online}）")
+        self._update_expire_bar(views)
+        self._update_tray_state(views)
 
     def refresh(self) -> None:
         if not self.service:
@@ -1033,6 +1310,12 @@ class App:
             ClientConfDialog(self.root, result, path, self._append_log)
             self._append_log(f"服务器备份：{result.backup}")
             self._append_log(result.reload_msg)
+            self.audit.record(
+                "add", host=self._audit_host(), name=result.name,
+                pubkey=result.public_key,
+                detail=f"分配地址 {'、'.join(result.addresses)}",
+                backup=result.backup,
+            )
             self.refresh()
 
         self._async("新增密钥", work, done)
@@ -1066,6 +1349,11 @@ class App:
             for k in keys:
                 self.vault.drop(k)
             self._append_log("已删除：" + "、".join(names))
+            for view in targets:
+                self.audit.record(
+                    "delete", host=self._audit_host(), name=view.name,
+                    pubkey=view.pubkey, detail=f"地址 {view.address or '-'}",
+                )
             self.refresh()
 
         self._async("删除密钥", work, done)
@@ -1100,6 +1388,11 @@ class App:
                 return
             self._append_log(f"已修改「{res.name}」：{'、'.join(res.changed)}")
             self.vault.rename(res.public_key, res.name)
+            self.audit.record(
+                "edit", host=self._audit_host(), name=res.name,
+                pubkey=res.public_key, detail="修改 " + "、".join(res.changed),
+                backup=res.backup,
+            )
             if res.backup:
                 self._append_log(f"服务器备份：{res.backup}")
             if res.reload_msg:
@@ -1200,7 +1493,19 @@ class App:
         host = (self.conn or {}).get("endpoint_host") or (self.conn or {}).get("host", "")
         HistoryDialog(self.root, self.history, host, self._append_log,
                       self._restore_snapshot,
-                      open_dir=self.history.root)
+                      open_dir=self.history.root, audit=self.audit)
+
+    def show_traffic(self) -> None:
+        if not self.service:
+            messagebox.showinfo("还没连上", "先连上服务器，才能看流量趋势",
+                                parent=self.root)
+            return
+        current = ""
+        selected = self.tree.selection()
+        if selected and selected[0] in self.row_keys:
+            current = self.row_keys[selected[0]]
+        TrafficDialog(self.root, self.traffic, self._entry_host(self.conn),
+                      self.views, current)
 
     def _restore_snapshot(self, text: str, entry: dict) -> None:
         """把选中的快照写回服务器。走 service.restore，和普通改动同一套安全流程。"""
@@ -1214,6 +1519,11 @@ class App:
                 self._append_log(f"还原前的状态也备份了一份：{res.backup}")
             if res.reload_msg:
                 self._append_log(res.reload_msg)
+            self.audit.record(
+                "restore", host=self._audit_host(),
+                detail=f"还原到 {entry['time']} 的快照（{entry['action']}之前）",
+                backup=res.backup,
+            )
             self.refresh()
 
         self._async("还原配置", work, done)
@@ -1344,6 +1654,30 @@ class App:
         self._on_auth_change()
 
     def _on_close(self) -> None:
+        """点窗口的 ×：托盘在跑就藏起来，否则真的退出。"""
+        if (self.tray and self.tray.running
+                and self.settings.get("minimize_to_tray", True)):
+            self.root.withdraw()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.notify("程序还在后台运行，右键托盘图标可以退出",
+                                 "已最小化到托盘")
+            return
+        self._really_quit()
+
+    def _really_quit(self) -> None:
+        self._cancel_monitor()
+        # 事件泵也要停：窗口销毁后这个 after 还在队列里，
+        # 触发时会报 invalid command name "..._poll"
+        if self._poll_job is not None:
+            try:
+                self.root.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        if self.tray is not None:
+            self.tray.stop()
+            self.tray = None
         for entry in list(self.servers.values()):
             self._close_entry(entry)
         # 安装流程里那条连接还没注册进 servers，单独关一次
@@ -1355,6 +1689,64 @@ class App:
             except Exception:
                 pass
         self.root.destroy()
+
+    # ------------------------------------------------------ 托盘 / 设置
+    def show_settings(self) -> None:
+        SettingsDialog(self.root, self)
+
+    def show_window(self) -> None:
+        """托盘菜单「显示主窗口」：从最小化状态恢复并提到最前。"""
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def _start_tray_if_enabled(self) -> None:
+        """启动后延迟开托盘：先让主窗口出来，别让托盘抢在前面。"""
+        try:
+            if not self.root.winfo_exists():
+                return
+        except Exception:
+            return
+        self._apply_tray(True)
+
+    def _apply_tray(self, enable: bool) -> None:
+        if enable:
+            if self.tray is None:
+                if not tray_mod.available():
+                    self._append_log("托盘不可用：缺少 pystray 或 Pillow")
+                    self.settings.set("tray_enabled", False)
+                    return
+                self.tray = tray_mod.Tray(
+                    self.root,
+                    on_show=self.show_window,
+                    on_quit=self._really_quit,
+                    on_check_update=self.check_update,
+                )
+            if not self.tray.start():
+                self._append_log("托盘启动失败，关闭窗口将直接退出")
+                self.tray = None
+                self.settings.set("tray_enabled", False)
+                return
+            self._append_log("已启用系统托盘，关掉窗口会最小化到这里")
+        else:
+            if self.tray is not None:
+                self.tray.stop()
+                self.tray = None
+                self._append_log("已关闭系统托盘")
+            self.show_window()
+        self.settings.set("tray_enabled", enable)
+
+    def _update_tray_state(self, views) -> None:
+        if not (self.tray and self.tray.running):
+            return
+        urgent = any(
+            v.expired or (v.expire_days is not None and v.expire_days <= 0)
+            for v in (views or [])
+        )
+        self.tray.set_state("alert" if urgent else "ok")
 
     def run(self) -> None:
         self.root.mainloop()
@@ -1380,6 +1772,7 @@ class AddDialog:
         self.dns = tk.StringVar(value=", ".join(dep.dns))
         self.endpoint = tk.StringVar(value=f"{dep.endpoint_host}:{dep.listen_port}")
         self.vpn_addresses = tk.StringVar()
+        self.expire = tk.StringVar()
         self.psk = tk.BooleanVar(value=default_psk)
         self.save_file = tk.BooleanVar(value=True)
 
@@ -1390,6 +1783,7 @@ class AddDialog:
             ("DNS：", self.dns, "客户端使用的 DNS"),
             ("服务端 Endpoint：", self.endpoint, "客户端连哪个地址，默认用 SSH 的 IP"),
             ("指定 VPN 地址：", self.vpn_addresses, "留空 = 自动分配空闲地址（推荐）"),
+            ("有效期至：", self.expire, "YYYY-MM-DD，留空 = 永久"),
         ]
         for i, (label, var, hint) in enumerate(rows):
             ttk.Label(frame, text=label, width=20, anchor="e").grid(row=i, column=0, sticky="e", pady=4)
@@ -1403,6 +1797,15 @@ class AddDialog:
         ttk.Checkbutton(checks, text="使用预共享密钥 PresharedKey", variable=self.psk).pack(anchor="w")
         ttk.Checkbutton(checks, text="同时把客户端 .conf 保存到 clients/ 目录（强烈建议）",
                         variable=self.save_file).pack(anchor="w", pady=(4, 0))
+        quick = ttk.Frame(checks)
+        quick.pack(anchor="w", pady=(8, 0))
+        ttk.Label(quick, text="有效期快捷键：", foreground="#777777").pack(side="left")
+        for text, days in (("7 天", 7), ("30 天", 30), ("90 天", 90)):
+            ttk.Button(quick, text=text, width=6,
+                       command=lambda d=days: self._set_expire(d)).pack(
+                side="left", padx=(4, 0))
+        ttk.Button(quick, text="永久", width=6,
+                   command=lambda: self.expire.set("")).pack(side="left", padx=(4, 0))
         ttk.Label(
             frame,
             text="注意：客户端私钥只会在生成时出现这一次，服务端只保存公钥，之后无法重新导出，请务必保存 .conf。",
@@ -1418,9 +1821,18 @@ class AddDialog:
         top.bind("<Escape>", lambda _e: top.destroy())
         show_dialog(top, parent, modal=True)
 
+    def _set_expire(self, days: int) -> None:
+        self.expire.set((dt.date.today() + dt.timedelta(days=days)).strftime("%Y-%m-%d"))
+
     def _ok(self) -> None:
         if not self.name.get().strip():
             messagebox.showwarning("缺少名称", "请填写密钥名称", parent=self.top)
+            return
+        expire = self.expire.get().strip()
+        if expire and not parse_expire_date(expire):
+            messagebox.showwarning("日期格式不对",
+                                   "有效期请写成 2026-11-12 这种格式，或点下面的快捷键",
+                                   parent=self.top)
             return
         params = {
             "name": self.name.get().strip(),
@@ -1430,6 +1842,7 @@ class AddDialog:
             "endpoint": self.endpoint.get().strip(),
             "use_psk": self.psk.get(),
             "vpn_addresses": self.vpn_addresses.get().strip(),
+            "expire": expire,
         }
         self.result = (params, self.save_file.get())
         self.top.destroy()
@@ -1456,11 +1869,13 @@ class EditDialog:
         self.name = tk.StringVar(value=view.raw_name)
         self.note = tk.StringVar(value=view.note)
         self.addr = tk.StringVar(value=view.allowed_ips)
+        self.expire = tk.StringVar(value=view.expire)
 
         rows = [
             ("名称 *：", self.name, "只影响显示，不动密钥本身"),
             ("备注：", self.note, "选填，例如 研发部 / 张三的手机"),
             ("VPN 地址：", self.addr, "多个用逗号分隔，如 10.8.0.9/32, fd08::9/128"),
+            ("有效期至：", self.expire, "YYYY-MM-DD，留空 = 永久"),
         ]
         for i, (label, var, hint) in enumerate(rows):
             ttk.Label(frame, text=label, width=13, anchor="e").grid(
@@ -1479,21 +1894,34 @@ class EditDialog:
         ttk.Label(key_row, text=view.pubkey, font=("Consolas", 9)).pack(side="left")
         ttk.Label(key_row, text="（不可修改）", foreground="#777777").pack(side="left", padx=(6, 0))
 
+        quick = ttk.Frame(frame)
+        quick.grid(row=len(rows) + 1, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(quick, text="有效期快捷键：", foreground="#777777").pack(side="left")
+        for text, days in (("7 天", 7), ("30 天", 30), ("90 天", 90)):
+            ttk.Button(quick, text=text, width=6,
+                       command=lambda d=days: self._set_expire(d)).pack(
+                side="left", padx=(4, 0))
+        ttk.Button(quick, text="永久", width=6,
+                   command=lambda: self.expire.set("")).pack(side="left", padx=(4, 0))
+
         ttk.Label(
             frame,
-            text="改名称、备注只动配置文件里的注释，对已连接的隧道没有影响；\n"
+            text="改名称、备注、有效期只动配置文件里的注释，对已连接的隧道没有影响；\n"
                  "改 VPN 地址会让该客户端立即断线，必须同步修改客户端配置里的 Address。",
             foreground="#a05000", wraplength=620, justify="left",
-        ).grid(row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        ).grid(row=len(rows) + 2, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=len(rows) + 2, column=0, columnspan=3, pady=(16, 0))
+        buttons.grid(row=len(rows) + 3, column=0, columnspan=3, pady=(16, 0))
         ttk.Button(buttons, text="保存修改", width=14, style="Accent.TButton",
                    command=self._ok).pack(side="right", padx=4)
         ttk.Button(buttons, text="取消", width=10, command=top.destroy).pack(side="right", padx=4)
         top.bind("<Return>", lambda _e: self._ok())
         top.bind("<Escape>", lambda _e: top.destroy())
         show_dialog(top, parent, modal=True)
+
+    def _set_expire(self, days: int) -> None:
+        self.expire.set((dt.date.today() + dt.timedelta(days=days)).strftime("%Y-%m-%d"))
 
     def _ok(self) -> None:
         name = self.name.get().strip()
@@ -1506,11 +1934,19 @@ class EditDialog:
             messagebox.showwarning("地址格式不对", str(exc), parent=self.top)
             return
 
+        expire = self.expire.get().strip()
+        if expire and not parse_expire_date(expire):
+            messagebox.showwarning("日期格式不对",
+                                   "有效期请写成 2026-11-12 这种格式，或点下面的快捷键",
+                                   parent=self.top)
+            return
+
         self.addr.set(addr)
         if (
             name == (self.view.raw_name or "")
             and self.note.get().strip() == (self.view.note or "")
             and addr == (self.view.allowed_ips or "")
+            and expire == (self.view.expire or "")
         ):
             self.top.destroy()  # 一个字都没改，直接关掉
             return
@@ -1519,11 +1955,13 @@ class EditDialog:
             "name": name,
             "note": self.note.get().strip(),
             "allowed_ips": addr,
+            "expire": expire,
         }
         self.top.destroy()
 
 
-def _save_card(parent, conf_text: str, name: str, note: str, log) -> None:
+def _save_card(parent, conf_text: str, name: str, note: str, log,
+               expire: str = "") -> None:
     """生成可发微信的分发卡片（二维码 + 名称 + 服务器 + 备注合成一张图）。"""
     path = filedialog.asksaveasfilename(
         parent=parent, title="保存分发卡片",
@@ -1534,9 +1972,12 @@ def _save_card(parent, conf_text: str, name: str, note: str, log) -> None:
     if not path:
         return
     try:
-        from .card import render_card
+        from .card import endpoint_of, render_card
 
-        render_card(conf_text, name=name, note=note, out_path=path)
+        # 服务器地址直接从配置里取，省得调用方还得单独传一遍
+        render_card(conf_text, name=name, note=note,
+                    endpoint=endpoint_of(conf_text), expire=expire,
+                    out_path=path)
     except Exception as exc:
         messagebox.showwarning(
             "生成卡片失败",
@@ -1608,6 +2049,7 @@ class ClientConfDialog:
                    command=lambda: _save_card(
                        top, result.client_conf, result.name,
                        getattr(result, "note", ""), log,
+                       getattr(result, "expire", ""),
                    )).pack(side="left", padx=6)
         ttk.Button(bar, text="关闭", width=10, command=top.destroy).pack(side="right")
         show_dialog(top, parent, width=700, height=520)
@@ -1681,30 +2123,61 @@ class SavedConfDialog:
 
 
 class HistoryDialog:
-    """配置历史：左边每次「改动前」的快照，右边预览，可一键还原。"""
+    """历史记录：配置快照可还原，操作日志可追溯。
 
-    def __init__(self, parent, history, host: str, log, restore_cb, open_dir: str = ""):
+    两件事都是「回溯过去发生了什么」，放同一个窗口的两个标签页，
+    省得工具栏再挤一个按钮 —— 那排已经排满了。
+    """
+
+    def __init__(self, parent, history, host: str, log, restore_cb,
+                 open_dir: str = "", audit=None):
         self.history = history
         self.host = host
         self.log = log
         self.restore_cb = restore_cb
+        self.audit = audit
         self.dir_path = open_dir or getattr(history, "root", "")
         self._rows: dict[str, dict] = {}
         self._current: tuple[str, dict] | None = None
+        self._audit_rows: list[dict] = []
 
         self.top = top = tk.Toplevel(parent)
         top.withdraw()
-        top.title("配置历史（每次改动前的原样）")
+        top.title("历史记录")
         frame = ttk.Frame(top, padding=12)
         frame.pack(fill="both", expand=True)
 
-        body = ttk.Frame(frame)
+        self.nb = ttk.Notebook(frame)
+        self.nb.pack(fill="both", expand=True)
+
+        snap = ttk.Frame(self.nb, padding=(0, 8, 0, 0))
+        self.nb.add(snap, text="   配置快照   ")
+        self._build_snapshot(snap)
+
+        rec = ttk.Frame(self.nb, padding=(0, 8, 0, 0))
+        self.nb.add(rec, text="   操作记录   ")
+        self._build_records(rec)
+
+        bottom = ttk.Frame(frame)
+        bottom.pack(fill="x", pady=(8, 0))
+        ttk.Button(bottom, text="关闭", width=10,
+                   command=top.destroy).pack(side="right")
+
+        self._load()
+        if self.audit:
+            self.rec_host_combo["values"] = ["全部"] + self.audit.hosts()
+        self._load_records()
+        show_dialog(top, parent, width=940, height=620)
+
+    # ------------------------------------------------------------ 配置快照
+    def _build_snapshot(self, parent) -> None:
+        body = ttk.Frame(parent)
         body.pack(fill="both", expand=True)
 
         left = ttk.Frame(body)
         left.pack(side="left", fill="y")
         cols = ("time", "action", "summary", "peers")
-        self.tree = ttk.Treeview(left, columns=cols, show="headings", height=18)
+        self.tree = ttk.Treeview(left, columns=cols, show="headings", height=15)
         for col, title, width in (
             ("time", "时间", 132), ("action", "操作", 82),
             ("summary", "摘要", 225), ("peers", "密钥数", 58),
@@ -1719,12 +2192,12 @@ class HistoryDialog:
 
         right = ttk.Frame(body)
         right.pack(side="left", fill="both", expand=True, padx=(10, 0))
-        self.preview = scrolledtext.ScrolledText(right, height=18, wrap="none",
+        self.preview = scrolledtext.ScrolledText(right, height=15, wrap="none",
                                                  font=("Consolas", 9))
         self.preview.pack(fill="both", expand=True)
         self.preview.configure(state="disabled")
 
-        bar = ttk.Frame(frame)
+        bar = ttk.Frame(parent)
         bar.pack(fill="x", pady=(10, 0))
         self.restore_btn = ttk.Button(bar, text="还原到此版本", width=15,
                                       style="Accent.TButton", command=self._restore,
@@ -1732,12 +2205,8 @@ class HistoryDialog:
         self.restore_btn.pack(side="left")
         ttk.Button(bar, text="打开历史目录", width=14,
                    command=self._open_dir).pack(side="left", padx=6)
-        ttk.Button(bar, text="关闭", width=10, command=top.destroy).pack(side="right")
         self.hint = ttk.Label(bar, text="", foreground="#8a8a8a")
         self.hint.pack(side="right", padx=10)
-
-        self._load()
-        show_dialog(top, parent, width=880, height=560)
 
     def _load(self) -> None:
         for iid in self.tree.get_children():
@@ -1792,6 +2261,341 @@ class HistoryDialog:
             os.startfile(self.dir_path)  # noqa: S606 - Windows only
         except Exception:
             messagebox.showinfo("历史目录", self.dir_path, parent=self.top)
+
+    # ------------------------------------------------------------ 操作记录
+    def _build_records(self, parent) -> None:
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="服务器：").pack(side="left")
+        self.rec_host = tk.StringVar(value="全部")
+        self.rec_host_combo = ttk.Combobox(bar, textvariable=self.rec_host,
+                                           state="readonly", width=26,
+                                           values=["全部"])
+        self.rec_host_combo.pack(side="left")
+        self.rec_host_combo.bind("<<ComboboxSelected>>",
+                                 lambda _e: self._load_records())
+
+        ttk.Label(bar, text="动作：").pack(side="left", padx=(12, 0))
+        self.rec_action = tk.StringVar(value="全部")
+        self.rec_action_combo = ttk.Combobox(
+            bar, textvariable=self.rec_action, state="readonly", width=11,
+            values=["全部"] + list(ACTION_LABELS.values()))
+        self.rec_action_combo.pack(side="left")
+        self.rec_action_combo.bind("<<ComboboxSelected>>",
+                                   lambda _e: self._load_records())
+
+        ttk.Label(bar, text="搜索：").pack(side="left", padx=(12, 0))
+        self.rec_kw = tk.StringVar()
+        kw = ttk.Entry(bar, textvariable=self.rec_kw, width=16)
+        kw.pack(side="left")
+        kw.bind("<Return>", lambda _e: self._load_records())
+        ttk.Button(bar, text="筛选", width=7,
+                   command=self._load_records).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="重置", width=7,
+                   command=self._reset_records).pack(side="left", padx=(4, 0))
+
+        body = ttk.Frame(parent)
+        body.pack(fill="both", expand=True, pady=(8, 0))
+        cols = ("time", "action", "host", "name", "detail", "result", "user")
+        self.rec_tree = ttk.Treeview(body, columns=cols, show="headings", height=15)
+        for col, title, width in (
+            ("time", "时间", 142), ("action", "动作", 78),
+            ("host", "服务器", 185), ("name", "密钥", 118),
+            ("detail", "详情", 230), ("result", "结果", 54),
+            ("user", "操作者", 70),
+        ):
+            self.rec_tree.heading(col, text=title)
+            self.rec_tree.column(col, width=width, minwidth=44, anchor="w")
+        vsb = ttk.Scrollbar(body, orient="vertical", command=self.rec_tree.yview)
+        self.rec_tree.configure(yscrollcommand=vsb.set)
+        self.rec_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+
+        foot = ttk.Frame(parent)
+        foot.pack(fill="x", pady=(10, 0))
+        ttk.Button(foot, text="导出 CSV", width=12,
+                   command=self._export).pack(side="left")
+        self.rec_hint = ttk.Label(foot, text="", foreground="#8a8a8a")
+        self.rec_hint.pack(side="right", padx=10)
+
+    def _load_records(self) -> None:
+        for iid in self.rec_tree.get_children():
+            self.rec_tree.delete(iid)
+        self._audit_rows = []
+        if not self.audit:
+            self.rec_hint.configure(text="未启用操作记录")
+            return
+        label = self.rec_action.get()
+        rows = self.audit.rows(
+            limit=1000,
+            host="" if self.rec_host.get() == "全部" else self.rec_host.get(),
+            action="" if label == "全部" else _ACTION_BY_LABEL.get(label, ""),
+            keyword=self.rec_kw.get().strip(),
+        )
+        self._audit_rows = rows
+        for r in rows:
+            self.rec_tree.insert("", "end", values=(
+                r.get("ts", ""),
+                ACTION_LABELS.get(r.get("action", ""), r.get("action", "")),
+                r.get("host", ""),
+                r.get("name", "") or "—",
+                r.get("detail", ""),
+                "成功" if r.get("result") == "ok" else "失败",
+                r.get("user", ""),
+            ))
+        self.rec_hint.configure(text=f"共 {len(rows)} 条")
+
+    def _reset_records(self) -> None:
+        self.rec_host.set("全部")
+        self.rec_action.set("全部")
+        self.rec_kw.set("")
+        self._load_records()
+
+    def _export(self) -> None:
+        if not self._audit_rows:
+            messagebox.showinfo("没有记录", "当前筛选条件下没有可导出的记录",
+                                parent=self.top)
+            return
+        default = f"操作记录-{dt.datetime.now():%Y%m%d-%H%M}.csv"
+        path = filedialog.asksaveasfilename(
+            parent=self.top, defaultextension=".csv", initialfile=default,
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            n = export_csv(self._audit_rows, path)
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc), parent=self.top)
+            return
+        self.rec_hint.configure(text=f"已导出 {n} 条到 {os.path.basename(path)}")
+        self.log(f"操作记录已导出：{path}")
+
+
+TRAFFIC_RANGES = [
+    ("最近 1 小时", 3600),
+    ("最近 6 小时", 6 * 3600),
+    ("最近 24 小时", 86400),
+    ("最近 7 天", 7 * 86400),
+]
+TRAFFIC_DOWN = "#1f8a4c"
+TRAFFIC_UP = "#c26a00"
+
+
+class TrafficDialog:
+    """单个密钥的流量趋势。
+
+    数据来自后台每 5 分钟一次的采样 —— `wg show transfer` 只有累计值，
+    速率是相邻两次做差算出来的。所以工具没运行的那段时间没有数据，
+    图上会是空的，这不是 bug。
+    """
+
+    def __init__(self, parent, store, host: str, views, current_pubkey: str = ""):
+        self.store = store
+        self.host = host
+        self.views = list(views or [])
+        self.pubkeys = [v.pubkey for v in self.views]
+        self.name_of = {v.pubkey: v.name for v in self.views}
+        labels = [f"{v.name} · {v.address or '无地址'}" for v in self.views]
+        self.labels = labels
+        self._geom = None
+        self._points: list[tuple] = []
+
+        self.top = top = tk.Toplevel(parent)
+        top.withdraw()
+        top.title("流量趋势")
+        frame = ttk.Frame(top, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="密钥：").pack(side="left")
+        self.peer_var = tk.StringVar()
+        self.peer_combo = ttk.Combobox(
+            bar, textvariable=self.peer_var, state="readonly", width=34,
+            values=labels or ["（没有密钥）"])
+        self.peer_combo.pack(side="left")
+        self.peer_combo.bind("<<ComboboxSelected>>", lambda _e: self._redraw())
+
+        ttk.Label(bar, text="范围：").pack(side="left", padx=(14, 0))
+        self.range_var = tk.StringVar(value=TRAFFIC_RANGES[2][0])
+        self.range_combo = ttk.Combobox(
+            bar, textvariable=self.range_var, state="readonly", width=12,
+            values=[r[0] for r in TRAFFIC_RANGES])
+        self.range_combo.pack(side="left")
+        self.range_combo.bind("<<ComboboxSelected>>", lambda _e: self._redraw())
+        ttk.Button(bar, text="刷新", width=8,
+                   command=self._redraw).pack(side="left", padx=(10, 0))
+
+        self.canvas = tk.Canvas(frame, height=300, background="#ffffff",
+                                highlightthickness=1,
+                                highlightbackground="#d8d8d8")
+        self.canvas.pack(fill="both", expand=True, pady=(10, 6))
+        self.canvas.bind("<Configure>", lambda _e: self._redraw())
+        self.canvas.bind("<Motion>", self._on_hover)
+        self.canvas.bind("<Leave>", lambda _e: self.canvas.delete("hover"))
+
+        foot = ttk.Frame(frame)
+        foot.pack(fill="x")
+        for color, text in ((TRAFFIC_DOWN, "下行"), (TRAFFIC_UP, "上行")):
+            box = ttk.Frame(foot)
+            box.pack(side="left", padx=(0, 14))
+            tk.Canvas(box, width=16, height=4, background=color,
+                      highlightthickness=0).pack(side="left", pady=8)
+            ttk.Label(box, text=text).pack(side="left", padx=(5, 0))
+        ttk.Button(foot, text="关闭", width=10,
+                   command=top.destroy).pack(side="right")
+        self.stats = ttk.Label(foot, text="", foreground="#555555")
+        self.stats.pack(side="right", padx=(0, 14))
+
+        self.hint = ttk.Label(frame, text="", foreground="#8a8a8a",
+                              wraplength=780, justify="left")
+        self.hint.pack(fill="x", pady=(6, 0))
+
+        if current_pubkey in self.pubkeys:
+            self.peer_combo.current(self.pubkeys.index(current_pubkey))
+        elif labels:
+            self.peer_combo.current(0)
+        else:
+            self.peer_var.set("（没有密钥）")
+
+        show_dialog(top, parent, width=840, height=540)
+        # 窗口刚映射时 winfo_width 还是 1，等布局稳定再画一次
+        top.after(80, self._redraw)
+        self._redraw()
+
+    # ------------------------------------------------------------ 绘制
+    def _range_seconds(self) -> int:
+        label = self.range_var.get()
+        for text, secs in TRAFFIC_RANGES:
+            if text == label:
+                return secs
+        return 86400
+
+    def _empty(self, message: str) -> None:
+        self._points = []
+        self._geom = None
+        self.canvas.delete("all")
+        w = max(self.canvas.winfo_width(), 200)
+        h = max(self.canvas.winfo_height(), 150)
+        self.canvas.create_text(w / 2, h / 2, text=message, fill="#999999",
+                                justify="center", width=max(w - 60, 160),
+                                font=(CN_FONT, 10))
+        self.stats.configure(text="")
+        self.hint.configure(text="")
+
+    def _redraw(self) -> None:
+        self.canvas.delete("all")
+        idx = self.peer_combo.current()
+        if idx < 0 or idx >= len(self.pubkeys):
+            self._empty("还没有可选的密钥")
+            return
+        pubkey = self.pubkeys[idx]
+        name = self.name_of.get(pubkey, "")
+        span = self.store.span(self.host, pubkey)
+        if not span:
+            self._empty(f"「{name}」还没有采样数据\n\n"
+                        "工具每 5 分钟采一次，连上服务器后放着不动就会慢慢积累。")
+            return
+
+        seconds = self._range_seconds()
+        now = time.time()
+        since = now - seconds
+        points = self.store.rates(self.host, pubkey, since=since)
+        if not points:
+            self._empty(f"「{name}」在「{self.range_var.get()}」内没有有效采样\n\n"
+                        "换一个更长的时间范围试试。")
+            return
+
+        self._points = points
+        w = max(self.canvas.winfo_width(), 240)
+        h = max(self.canvas.winfo_height(), 180)
+        pad_l, pad_r, pad_t, pad_b = 78, 18, 16, 30
+        plot_w = w - pad_l - pad_r
+        plot_h = h - pad_t - pad_b
+        if plot_w < 60 or plot_h < 40:
+            return
+
+        peak = max(max(p[1] for p in points), max(p[2] for p in points), 1.0)
+        ymax = nice_rate_ceiling(peak)
+        t0, t1 = since, now
+        self._geom = (pad_l, plot_w, t0, t1, ymax, pad_t, plot_h)
+
+        # 横向网格 + Y 轴刻度
+        for i in range(5):
+            y = pad_t + plot_h * i / 4
+            self.canvas.create_line(pad_l, y, pad_l + plot_w, y, fill="#ededed")
+            self.canvas.create_text(pad_l - 8, y, anchor="e", fill="#888888",
+                                    font=(CN_FONT, 8),
+                                    text=human_rate(ymax * (1 - i / 4)))
+
+        # X 轴时间标签
+        for i in range(5):
+            ts = t0 + (t1 - t0) * i / 4
+            x = pad_l + plot_w * i / 4
+            fmt = "%H:%M" if seconds <= 86400 else "%m-%d"
+            self.canvas.create_text(x, pad_t + plot_h + 12, anchor="n",
+                                    fill="#888888", font=(CN_FONT, 8),
+                                    text=time.strftime(fmt, time.localtime(ts)))
+
+        def xy(ts, val):
+            x = pad_l + (ts - t0) / max(t1 - t0, 1) * plot_w
+            y = pad_t + plot_h * (1 - min(val, ymax) / ymax)
+            return x, y
+
+        for which, color in ((1, TRAFFIC_DOWN), (2, TRAFFIC_UP)):
+            coords = []
+            for p in points:
+                coords.extend(xy(p[0], p[which]))
+            if len(coords) >= 4:
+                self.canvas.create_line(*coords, fill=color, width=2)
+            elif coords:
+                x, y = coords[0], coords[1]
+                self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3,
+                                        fill=color, outline="")
+
+        downs = [p[1] for p in points]
+        ups = [p[2] for p in points]
+        self.stats.configure(
+            text=f"共 {len(points)} 点   "
+                 f"峰值 ↓{human_rate(max(downs))} ↑{human_rate(max(ups))}   "
+                 f"均值 ↓{human_rate(sum(downs) / len(downs))} "
+                 f"↑{human_rate(sum(ups) / len(ups))}")
+
+        first = time.strftime("%m-%d %H:%M", time.localtime(span[0]))
+        self.hint.configure(
+            text=f"采样从 {first} 开始，目前共 {self.store.count()} 个点（全服务器合计）。"
+                 "只在工具开着并连着服务器时才采；两次采样间隔超过 15 分钟、"
+                 "或累计值变小（服务重启）的那一段会被丢弃，不会画成负值。")
+
+    def _on_hover(self, event) -> None:
+        self.canvas.delete("hover")
+        if not self._geom or not self._points:
+            return
+        pad_l, plot_w, t0, t1, _ymax, pad_t, plot_h = self._geom
+        if not (pad_l <= event.x <= pad_l + plot_w):
+            return
+
+        def x_of(ts):
+            return pad_l + (ts - t0) / max(t1 - t0, 1) * plot_w
+
+        best = min(self._points, key=lambda p: abs(x_of(p[0]) - event.x))
+        x = x_of(best[0])
+        self.canvas.create_line(x, pad_t, x, pad_t + plot_h, fill="#bbbbbb",
+                                dash=(2, 3), tags="hover")
+        text = (f"{time.strftime('%m-%d %H:%M', time.localtime(best[0]))}\n"
+                f"↓ {human_rate(best[1])}\n↑ {human_rate(best[2])}")
+        anchor = "nw" if x < pad_l + plot_w * 0.7 else "ne"
+        item = self.canvas.create_text(
+            x + (8 if anchor == "nw" else -8), pad_t + 6, text=text,
+            anchor=anchor, justify="left", fill="#333333",
+            font=(CN_FONT, 8), tags="hover")
+        bbox = self.canvas.bbox(item)
+        if bbox:
+            rect = self.canvas.create_rectangle(
+                bbox[0] - 4, bbox[1] - 2, bbox[2] + 4, bbox[3] + 2,
+                fill="#fffdf0", outline="#dddddd", tags="hover")
+            self.canvas.tag_lower(rect, item)
 
 
 class QrDialog:
@@ -1912,6 +2716,138 @@ class DownloadDialog:
             )
 
 
+class SettingsDialog:
+    """界面设置：托盘、开机自启、刷新间隔。
+
+    这里的开关都即时生效，没有「确定 / 取消」——
+    省得用户改完点了 × 以为保存了、其实没保存。
+    """
+
+    def __init__(self, parent, app):
+        self.app = app
+        self.settings = app.settings
+        self.top = top = tk.Toplevel(parent)
+        top.withdraw()
+        top.title("设置")
+        top.resizable(False, False)
+
+        frame = ttk.Frame(top, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        # ---------------------------------------------------------- 托盘
+        self.tray_var = tk.BooleanVar(
+            value=bool(self.settings.get("tray_enabled", True)))
+        tray_ok = tray_mod.available()
+        self.tray_check = ttk.Checkbutton(
+            frame, text="启用系统托盘（关掉窗口时缩到托盘，后台继续刷新状态）",
+            variable=self.tray_var, command=self._on_tray)
+        self.tray_check.pack(anchor="w")
+        if not tray_ok:
+            self.tray_check.configure(state="disabled")
+            ttk.Label(frame, text="pystray 或 Pillow 不可用，这个选项用不了",
+                      foreground="#b03030").pack(anchor="w", padx=(20, 0))
+
+        self.min_var = tk.BooleanVar(
+            value=bool(self.settings.get("minimize_to_tray", True)))
+        ttk.Checkbutton(
+            frame, text="点 × 时最小化到托盘（不勾则直接退出程序）",
+            variable=self.min_var, command=self._on_minimize,
+        ).pack(anchor="w", padx=(20, 0), pady=(4, 0))
+
+        ttk.Separator(frame).pack(fill="x", pady=12)
+
+        # ---------------------------------------------------------- 开机自启
+        ok, reason = autostart_mod.supported()
+        self.auto_var = tk.BooleanVar(value=autostart_mod.is_enabled())
+        self.auto_check = ttk.Checkbutton(
+            frame, text="开机自动启动（登录 Windows 后自动打开并缩到托盘）",
+            variable=self.auto_var, command=self._on_autostart)
+        self.auto_check.pack(anchor="w")
+        if ok:
+            current = autostart_mod.current_target()
+            ttk.Label(frame, text=("当前注册路径：" + current) if current else "目前没有设置",
+                      foreground="#8a8a8a", wraplength=520,
+                      justify="left").pack(anchor="w", padx=(20, 0))
+        else:
+            self.auto_check.configure(state="disabled")
+            ttk.Label(frame, text=reason, foreground="#8a8a8a", wraplength=520,
+                      justify="left").pack(anchor="w", padx=(20, 0))
+
+        ttk.Separator(frame).pack(fill="x", pady=12)
+
+        # ---------------------------------------------------------- 刷新间隔
+        row = ttk.Frame(frame)
+        row.pack(fill="x")
+        ttk.Label(row, text="自动刷新间隔：").pack(side="left")
+        self._intervals = [("30 秒", 30), ("60 秒", 60), ("2 分钟", 120),
+                           ("5 分钟", 300)]
+        current_secs = int(self.settings.get("monitor_interval", 60))
+        label = next((t for t, s in self._intervals if s == current_secs), "60 秒")
+        self.interval_var = tk.StringVar(value=label)
+        combo = ttk.Combobox(row, textvariable=self.interval_var, state="readonly",
+                             width=10, values=[t for t, _ in self._intervals])
+        combo.pack(side="left")
+        combo.bind("<<ComboboxSelected>>", lambda _e: self._on_interval())
+        ttk.Label(row, text="掉线 / 上线只在状态翻转时记一条日志",
+                  foreground="#8a8a8a").pack(side="left", padx=(10, 0))
+
+        ttk.Label(
+            frame,
+            text="自动刷新和流量采样都依赖工具开着。关掉程序后不会再采任何数据；\n"
+                 "但已经建立的隧道不受影响 —— 它们在服务器上独立运行。",
+            foreground="#777777", justify="left",
+        ).pack(anchor="w", pady=(14, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(16, 0))
+        ttk.Button(buttons, text="关闭", width=10,
+                   command=top.destroy).pack(side="right")
+        ttk.Button(buttons, text="打开数据目录", width=13,
+                   command=self._open_dir).pack(side="left")
+
+        show_dialog(top, parent, width=620, height=380)
+
+    def _on_tray(self) -> None:
+        self.app._apply_tray(self.tray_var.get())
+        self.tray_var.set(bool(self.settings.get("tray_enabled", True)))
+
+    def _on_minimize(self) -> None:
+        self.settings.set("minimize_to_tray", self.min_var.get())
+
+    def _on_autostart(self) -> None:
+        if self.auto_var.get():
+            ok, msg = autostart_mod.enable()
+            if not ok:
+                messagebox.showwarning("设置失败", msg, parent=self.top)
+                self.auto_var.set(False)
+                return
+            self.settings.set("autostart", True)
+            self.app._append_log(f"已设置开机自启：{msg}")
+        else:
+            ok, msg = autostart_mod.disable()
+            if not ok:
+                messagebox.showwarning("取消失败", msg, parent=self.top)
+                self.auto_var.set(True)
+                return
+            self.settings.set("autostart", False)
+            self.app._append_log(msg)
+
+    def _on_interval(self) -> None:
+        secs = next((s for t, s in self._intervals
+                     if t == self.interval_var.get()), 60)
+        self.settings.set("monitor_interval", secs)
+        self.app.monitor_interval = secs * 1000
+        if self.app.monitor_var.get():
+            self.app._schedule_monitor(delay=500)
+        self.app._append_log(f"自动刷新间隔改为 {self.interval_var.get()}")
+
+    def _open_dir(self) -> None:
+        try:
+            os.startfile(APP_DIR)  # noqa: S606 - Windows only
+        except Exception:
+            messagebox.showinfo("数据目录", APP_DIR, parent=self.top)
+
+
 class DetailDialog:
     def __init__(self, parent, view):
         top = tk.Toplevel(parent)
@@ -1921,7 +2857,10 @@ class DetailDialog:
         frame.pack(fill="both", expand=True)
         lines = [
             ("名称", view.name), ("备注", view.note or "-"),
-            ("创建时间", view.created or "-"), ("公钥", view.pubkey),
+            ("创建时间", view.created or "-"),
+            ("有效期", (view.expire or "永久")
+             + (f"（{view.expire_text}）" if view.expire_text else "")),
+            ("公钥", view.pubkey),
             ("AllowedIPs", view.allowed_ips), ("VPN 地址", view.address),
             ("最近握手", view.handshake), ("流量", view.traffic),
             ("来源端点", view.endpoint), ("预共享密钥", "有" if view.has_psk else "无"),

@@ -10,6 +10,8 @@ hiddenimports = (
     # card.py 里 PIL 是函数内延迟导入（只有点「生成卡片」才加载），
     # 静态分析容易漏掉，这里显式声明
     ["paramiko", "segno", "PIL", "PIL.Image", "PIL.ImageDraw", "PIL.ImageFont"]
+    # pystray 按平台动态挑后端（Windows 是 pystray._win32），静态分析看不到
+    + ["pystray", "pystray._win32", "pystray._base"]
     + collect_submodules("paramiko")
     + collect_submodules("segno")
 )

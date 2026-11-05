@@ -64,7 +64,8 @@ def endpoint_of(conf_text: str) -> str:
 
 
 def render_card(conf_text: str, *, name: str = "", note: str = "",
-                endpoint: str = "", out_path: str = "") -> str:
+                endpoint: str = "", expire: str = "",
+                out_path: str = "") -> str:
     """生成卡片 PNG，返回写入的路径。out_path 为空时返回 PNG 字节的 base64。"""
     if not (conf_text or "").strip():
         raise ValueError("没有客户端配置内容，无法生成卡片")
@@ -97,6 +98,8 @@ def render_card(conf_text: str, *, name: str = "", note: str = "",
     info = []
     if endpoint:
         info.append(("服务器", endpoint))
+    if expire:
+        info.append(("有效期至", expire))
     info.append(("生成时间", _today()))
     y += len(info) * 26 + 10
 
