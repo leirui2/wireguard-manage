@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import io
 import ipaddress
 import os
 import re
@@ -208,6 +209,28 @@ def patch_client_conf(text: str, addresses: list[str]) -> str:
             lines.insert(i + 1, new_line)
             return "\n".join(lines)
     raise ValueError("该配置文件里没有 [Interface] 段，无法自动修改")
+
+
+def qr_png(text: str, *, target_px: int = 520, border: int = 3,
+           error: str = "m") -> tuple[bytes, int]:
+    """把一段文本（这里是完整的客户端配置）编码成 PNG 二维码。
+
+    返回 (png 字节, 二维码版本号)。用纯 Python 的 segno，不依赖 Pillow；
+    error='m' 是 15% 容错，手机对着屏幕扫足够用，也不太会让码变太大。
+    target_px 控制屏幕上的实际像素，太小手机对焦会吃力。
+    """
+    try:
+        import segno
+    except Exception as exc:  # pragma: no cover - 依赖缺失时的兜底
+        raise RuntimeError(
+            f"缺少二维码库 segno（{exc}）。请执行：python -m pip install --target vendor segno"
+        )
+    qr = segno.make(text, error=error, micro=False)
+    width, _ = qr.symbol_size(scale=1, border=border)
+    scale = max(2, min(16, target_px // max(width, 1)))
+    buf = io.BytesIO()
+    qr.save(buf, kind="png", scale=scale, border=border)
+    return buf.getvalue(), int(qr.version)
 
 
 def short_key(key: str, n: int = 10) -> str:

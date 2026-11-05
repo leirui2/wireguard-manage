@@ -128,6 +128,60 @@ class TestUtil(unittest.TestCase):
             with self.assertRaises(ValueError):
                 normalize_allowed_ips(bad)
 
+    def test_qr_png(self):
+        import struct
+
+        from wgmanager.util import qr_png
+
+        conf = (
+            "[Interface]\nPrivateKey = aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789ABCDEF=\n"
+            "Address = 10.8.0.6/32\nDNS = 1.1.1.1\n\n[Peer]\n"
+            "PublicKey = QwErTyUiOpAsDfGhJkLzXcVbNm1234567890abcde=\n"
+            "AllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.10:51820\n"
+        )
+        png, version = qr_png(conf)
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"), "不是合法的 PNG")
+        self.assertGreater(len(png), 500)
+        self.assertGreaterEqual(version, 1)
+        width, height = struct.unpack(">II", png[16:24])  # IHDR 里的宽高
+        self.assertEqual(width, height, "二维码应该是正方形")
+        self.assertGreaterEqual(width, 200, "二维码太小，手机扫不动")
+
+        _small, v_small = qr_png(conf)
+        _big, v_big = qr_png(conf * 8)
+        self.assertGreater(v_big, v_small, "内容变长后二维码版本应该变高")
+
+    def test_qr_symbol_is_well_formed(self):
+        """三个定位角 + 时序图形都在，确保生成的确实是可扫的二维码。"""
+        import segno
+
+        text = (
+            "[Interface]\nPrivateKey = aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789ABCDEF=\n"
+            "Address = 10.8.0.6/32\nDNS = 1.1.1.1\n\n[Peer]\n"
+            "PublicKey = QwErTyUiOpAsDfGhJkLzXcVbNm1234567890abcde=\n"
+            "AllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.10:51820\n"
+        )
+        m = [list(row) for row in segno.make(text, error="m", micro=False).matrix]
+        n = len(m)
+
+        def finder(r, c):
+            blk = [m[r + i][c : c + 7] for i in range(7)]
+            return (
+                all(v == 1 for v in blk[0])
+                and all(v == 1 for v in blk[6])
+                and all(row[0] == 1 and row[6] == 1 for row in blk)
+                and all(v == 0 for v in blk[1][1:6])
+                and all(v == 0 for v in blk[5][1:6])
+                and all(blk[3][j] == 1 for j in range(2, 5))
+            )
+
+        self.assertTrue(finder(0, 0), "缺左上定位角")
+        self.assertTrue(finder(0, n - 7), "缺右上定位角")
+        self.assertTrue(finder(n - 7, 0), "缺左下定位角")
+        timing = m[6][8 : n - 8]
+        self.assertTrue(all(timing[i] != timing[i + 1] for i in range(len(timing) - 1)),
+                        "时序图形不交替，不是合法二维码")
+
     def test_patch_client_conf(self):
         from wgmanager.util import patch_client_conf
 

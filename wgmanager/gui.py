@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import queue
@@ -20,6 +21,7 @@ from .service import WGService
 from .util import (
     normalize_allowed_ips,
     patch_client_conf,
+    qr_png,
     safe_filename,
     stamp,
 )
@@ -973,8 +975,71 @@ class ClientConfDialog:
 
         ttk.Button(bar, text="复制全部", width=12, command=copy_all).pack(side="left")
         ttk.Button(bar, text="另存为…", width=12, command=save_as).pack(side="left", padx=6)
+        ttk.Button(bar, text="生成二维码", width=13, style="Accent.TButton",
+                   command=lambda: QrDialog(
+                       top, f"「{result.name}」的二维码", result.client_conf,
+                       safe_filename(result.name), log,
+                   )).pack(side="left")
         ttk.Button(bar, text="关闭", width=12, command=top.destroy).pack(side="right")
         show_dialog(top, parent, width=680, height=520)
+
+
+class QrDialog:
+    """把客户端配置渲染成二维码，手机 WireGuard App 扫码即可导入。
+
+    只在「刚生成密钥」这一步可用：服务端只存公钥，事后无法再导出客户端私钥。
+    """
+
+    def __init__(self, parent, title: str, payload: str, filename_hint: str, log):
+        top = tk.Toplevel(parent)
+        top.withdraw()
+        top.title(title)
+        top.resizable(False, False)
+        frame = ttk.Frame(top, padding=14)
+        frame.pack(fill="both", expand=True)
+
+        try:
+            png, version = qr_png(payload)
+        except Exception as exc:
+            ttk.Label(frame, text="生成二维码失败：\n" + str(exc), wraplength=460,
+                      justify="left", foreground="#a00000").pack(pady=10)
+            ttk.Button(frame, text="关闭", width=12, command=top.destroy).pack(pady=(10, 0))
+            show_dialog(top, parent, width=540, height=220)
+            return
+
+        # PhotoImage 必须留引用，否则会被垃圾回收、显示成空白
+        self.image = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
+        ttk.Label(frame, image=self.image).pack(pady=(0, 10))
+        ttk.Label(
+            frame,
+            text="用手机 WireGuard App 的「扫描二维码」导入。\n"
+                 "码里含客户端私钥，扫完别截图外传。",
+            justify="center", foreground="#a05000",
+        ).pack()
+        log(f"已生成二维码（QR 版本 {version}，{len(png)} 字节）")
+
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", pady=(12, 0))
+
+        def save_png():
+            path = filedialog.asksaveasfilename(
+                parent=top, title="保存二维码",
+                initialfile=f"{filename_hint}-qr.png",
+                defaultextension=".png",
+                filetypes=[("PNG 图片", "*.png"), ("所有文件", "*.*")],
+            )
+            if path:
+                try:
+                    with open(path, "wb") as f:
+                        f.write(png)
+                except Exception as exc:
+                    messagebox.showwarning("保存失败", str(exc), parent=top)
+                    return
+                log(f"二维码已保存到 {path}")
+
+        ttk.Button(bar, text="保存为 PNG", width=14, command=save_png).pack(side="left")
+        ttk.Button(bar, text="关闭", width=12, command=top.destroy).pack(side="right")
+        show_dialog(top, parent)
 
 
 class DetailDialog:
