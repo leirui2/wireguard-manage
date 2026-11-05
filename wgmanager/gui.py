@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
 import queue
@@ -17,7 +18,9 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from .backend import make_backend
 from .downloads import CLIENTS, OFFICIAL_INSTALL_PAGE, open_url
-from .probe import ProbeError, probe
+from .installer import Options as InstallOptions
+from .installer import build_plan, run_install
+from .probe import ProbeError, ServerMissing, probe
 from .service import WGService
 from .util import (
     normalize_allowed_ips,
@@ -149,6 +152,7 @@ class App:
         self.backend = None
         self.target = None
         self.dep = None
+        self.conn: dict = {}
         self.service: WGService | None = None
         self.views = []
         self.row_keys: dict[str, str] = {}
@@ -435,6 +439,13 @@ class App:
             messagebox.showwarning("填写不完整", str(exc), parent=self.root)
             return
         self._save_current_profile(conn)
+        self.conn = conn
+        if self.backend:  # 上一次连接（比如安装失败后重试）先关掉，避免连接泄漏
+            try:
+                self.backend.close()
+            except Exception:
+                pass
+            self.backend = None
 
         def work():
             backend = make_backend(conn, log=self._log)
@@ -442,15 +453,27 @@ class App:
                 target, dep = probe(backend, conn, self._log)
                 svc = WGService(target, dep, self._log)
                 views = svc.list_peers()
+            except ServerMissing as exc:
+                # 保留这条连接，装完直接用，不用重新输密码
+                return {"kind": "missing", "backend": backend, "error": exc}
             except Exception:
                 backend.close()
                 raise
-            return backend, target, dep, svc, views
+            return {"kind": "ok", "backend": backend, "target": target,
+                    "dep": dep, "service": svc, "views": views}
 
         self._async("连接", work, self._on_connected)
 
     def _on_connected(self, payload) -> None:
-        self.backend, self.target, self.dep, self.service, views = payload
+        if payload.get("kind") == "missing":
+            self._start_install_flow(payload["backend"], payload["error"])
+            return
+
+        self.backend = payload["backend"]
+        self.target = payload["target"]
+        self.dep = payload["dep"]
+        self.service = payload["service"]
+        views = payload["views"]
         self.status_var.set("● 已连接")
         self.info_var.set(self.dep.summary)
         self._fill(views)
@@ -464,6 +487,72 @@ class App:
                 "检测到以下情况，请留意：\n\n• " + "\n• ".join(self.dep.notes),
                 parent=self.root,
             )
+
+    # ---------------------------------------------------------- 一键装服务端
+    def _start_install_flow(self, backend, exc) -> None:
+        self.backend = backend
+        self.status_var.set("● 已连接，但服务器上没有 WireGuard 服务端")
+        self.info_var.set("未安装 WireGuard 服务端")
+        self._set_buttons()
+        self._append_log("探测：服务器上没有可用的 WireGuard 服务端")
+
+        if not getattr(exc, "installable", True):
+            messagebox.showwarning("无法继续", str(exc), parent=self.root)
+            self.disconnect()
+            return
+
+        host = (self.conn or {}).get("endpoint_host") or (self.conn or {}).get("host", "")
+
+        def work():
+            return build_plan(backend, InstallOptions(), host)
+
+        def done(plan):
+            dlg = InstallDialog(self.root, plan)
+            self.root.wait_window(dlg.top)
+            if not dlg.result:
+                self._append_log("已取消安装")
+                self.disconnect()
+                return
+            self._run_install(plan, dlg.result)
+
+        self._async("检查安装环境", work, done)
+
+    def _run_install(self, plan, options) -> None:
+        backend = self.backend
+
+        def work():
+            # 用户可能改过网段/端口，按最终参数重新出方案（都是只读命令，很快）
+            fresh = build_plan(backend, options, plan.endpoint_host)
+            return run_install(backend, fresh, options, self._log)
+
+        def done(res):
+            for note in res.warnings:
+                self._append_log("注意：" + note)
+            self._append_log(res.message)
+            text = (
+                f"WireGuard 服务端已装好：\n\n"
+                f"接口：{res.iface}\n配置：{res.conf_path}\n"
+                f"服务端公钥：{res.public_key}"
+            )
+            if res.warnings:
+                text += "\n\n注意：\n• " + "\n• ".join(res.warnings)
+            messagebox.showinfo("安装完成", text, parent=self.root)
+            self._reprobe()
+
+        self._async("安装 WireGuard 服务端", work, done)
+
+    def _reprobe(self) -> None:
+        """安装完重新走一遍探测，成功后就是正常的已连接状态。"""
+        backend = self.backend
+        conn = self.conn or {}
+
+        def work():
+            target, dep = probe(backend, conn, self._log)
+            svc = WGService(target, dep, self._log)
+            return {"kind": "ok", "backend": backend, "target": target,
+                    "dep": dep, "service": svc, "views": svc.list_peers()}
+
+        self._async("重新探测", work, self._on_connected)
 
     def disconnect(self) -> None:
         if self.backend:
@@ -1141,6 +1230,160 @@ class DetailDialog:
         show_dialog(top, parent, width=620, height=380)
 
 
+class InstallDialog:
+    """服务器上没有 WireGuard 服务端时，展示安装方案并收集选项。
+
+    这里只收集参数，不执行任何命令；点「开始安装」之后才真正动服务器。
+    """
+
+    def __init__(self, parent, plan):
+        self.result = None
+        self.plan = plan
+        self.top = top = tk.Toplevel(parent)
+        top.withdraw()
+        top.title("一键安装 WireGuard 服务端")
+        top.resizable(False, False)
+        frame = ttk.Frame(top, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text=f"检测到 {plan.platform.label}，服务器上还没有 WireGuard 服务端",
+                  font=(CN_FONT, 11, "bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(frame, text="下面这些操作会修改服务器系统，确认后才会执行。",
+                  foreground="#a05000").grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(4, 10))
+
+        self.subnet = tk.StringVar(value=plan.subnet)
+        self.port = tk.StringVar(value=str(plan.listen_port))
+        self.nat = tk.BooleanVar(value=bool(plan.default_iface))
+        self.forward = tk.BooleanVar(value=True)
+        self.firewall = tk.BooleanVar(value=False)
+
+        ttk.Label(frame, text="VPN 网段：", anchor="e", width=12).grid(
+            row=2, column=0, sticky="e", pady=4)
+        ttk.Entry(frame, textvariable=self.subnet, width=22).grid(
+            row=2, column=1, sticky="w", pady=4)
+        ttk.Label(frame, text="服务端会占 .1，客户端从这里分配", foreground="#777777").grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=(10, 0))
+
+        ttk.Label(frame, text="监听端口：", anchor="e", width=12).grid(
+            row=3, column=0, sticky="e", pady=4)
+        ttk.Entry(frame, textvariable=self.port, width=22).grid(
+            row=3, column=1, sticky="w", pady=4)
+        ttk.Label(frame, text="UDP，默认 51820", foreground="#777777").grid(
+            row=3, column=2, columnspan=2, sticky="w", padx=(10, 0))
+
+        ttk.Label(frame, text="出口网卡：", anchor="e", width=12).grid(
+            row=4, column=0, sticky="e", pady=4)
+        ttk.Label(frame, text=plan.default_iface or "（未识别，将不写 NAT 规则）").grid(
+            row=4, column=1, sticky="w", pady=4)
+        if plan.firewall:
+            ttk.Label(frame, text=f"已启用 {plan.firewall}", foreground="#a05000").grid(
+                row=4, column=2, columnspan=2, sticky="w", padx=(10, 0))
+
+        checks = ttk.Frame(frame)
+        checks.grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(checks, text="允许客户端通过本机上网（写 iptables NAT 规则）",
+                        variable=self.nat, command=self._refresh_steps).pack(anchor="w")
+        ttk.Checkbutton(checks, text="开启 IP 转发（net.ipv4.ip_forward=1，持久化）",
+                        variable=self.forward, command=self._refresh_steps).pack(
+            anchor="w", pady=(2, 0))
+        if plan.firewall:
+            ttk.Checkbutton(
+                checks,
+                text=f"在 {plan.firewall} 放行 UDP {plan.listen_port}（不开的话客户端可能连不上）",
+                variable=self.firewall, command=self._refresh_steps,
+            ).pack(anchor="w", pady=(2, 0))
+
+        ttk.Label(frame, text="即将执行：").grid(
+            row=6, column=0, columnspan=4, sticky="w", pady=(12, 4))
+        self.steps = scrolledtext.ScrolledText(frame, height=8, width=76,
+                                               font=(CN_FONT, 9), wrap="word")
+        self.steps.grid(row=7, column=0, columnspan=4, sticky="ew")
+        self.steps.configure(state="disabled")
+
+        if plan.notes:
+            ttk.Label(frame, text="注意：\n• " + "\n• ".join(plan.notes),
+                      foreground="#a05000", justify="left", wraplength=600).grid(
+                row=8, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(14, 0))
+        ttk.Button(buttons, text="开始安装", width=14, style="Accent.TButton",
+                   command=self._ok).pack(side="right", padx=4)
+        ttk.Button(buttons, text="取消", width=10,
+                   command=top.destroy).pack(side="right", padx=4)
+
+        self._refresh_steps()
+        top.bind("<Escape>", lambda _e: top.destroy())
+        show_dialog(top, parent, modal=True)
+
+    def _refresh_steps(self) -> None:
+        net = self.subnet.get().strip() or self.plan.subnet
+        port = self.port.get().strip() or str(self.plan.listen_port)
+        index = 1
+        lines = [
+            f"{index}. 安装 WireGuard（{self.plan.platform.label}）",
+        ]
+        index += 1
+        lines.append(f"{index}. 生成服务端密钥对（私钥只写进配置文件，不进日志）")
+        index += 1
+        lines.append(f"{index}. 写入 {self.plan.conf_path}：网段 {net}，UDP {port}，权限 600")
+        index += 1
+        if self.nat.get():
+            lines.append(
+                f"{index}. 写 NAT 规则：客户端流量经 {self.plan.default_iface} 转发出去"
+                if self.plan.default_iface
+                else f"{index}. 未识别出口网卡，跳过 NAT（客户端只能访问本机）"
+            )
+            index += 1
+        if self.forward.get() and not self.plan.forward_enabled:
+            lines.append(f"{index}. 开启 IP 转发并持久化到 /etc/sysctl.d/99-wireguard.conf")
+            index += 1
+        lines.append(f"{index}. 启用并启动 wg-quick@{self.plan.iface}")
+        index += 1
+        if self.firewall.get() and self.plan.firewall:
+            lines.append(f"{index}. 在 {self.plan.firewall} 放行 UDP {port}")
+        lines.append("")
+        lines.append("安装完成后会自动重新连接并进入管理界面。")
+
+        self.steps.configure(state="normal")
+        self.steps.delete("1.0", "end")
+        self.steps.insert("1.0", "\n".join(lines))
+        self.steps.configure(state="disabled")
+
+    def _ok(self) -> None:
+        try:
+            net = ipaddress.ip_network(self.subnet.get().strip(), strict=False)
+        except ValueError:
+            messagebox.showwarning("网段不对", "VPN 网段填写有误，例如 10.8.0.0/24", parent=self.top)
+            return
+        if net.version != 4:
+            messagebox.showwarning("只支持 IPv4", "目前只支持用 IPv4 网段做 VPN 内网", parent=self.top)
+            return
+        if net.prefixlen > 30:
+            messagebox.showwarning("网段太小", "至少要能放下服务端 + 客户端，建议用 /24", parent=self.top)
+            return
+        try:
+            port = int(self.port.get().strip())
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("端口不对", "监听端口要在 1-65535 之间", parent=self.top)
+            return
+
+        self.result = InstallOptions(
+            iface=self.plan.iface,
+            subnet=str(net),
+            listen_port=port,
+            endpoint_host=self.plan.endpoint_host,
+            enable_forward=self.forward.get() or self.nat.get(),
+            enable_nat=self.nat.get(),
+            open_firewall=self.firewall.get(),
+        )
+        self.top.destroy()
+
+
 class AdvancedDialog:
     def __init__(self, parent, conf_var, iface_var, endpoint_var):
         top = tk.Toplevel(parent)
@@ -1188,6 +1431,15 @@ HELP_TEXT = """WireGuard 密钥管理工具 · 使用说明
 【查看】
 列表显示备注名、公钥前缀、VPN 地址、最近握手、流量和在线状态（5 分钟内有握手视为在线）。
 双击某一行可以看完整公钥。
+
+【服务器上没有 WireGuard】
+如果连上去发现服务器还没装 WireGuard 服务端，工具会弹出安装方案，确认后一键完成：
+装包 → 生成服务端密钥 → 写 /etc/wireguard/wg0.conf → 开 IP 转发 → 启动 wg-quick@wg0。
+· 会自动挑一个没被占用的网段和端口，也可以在弹窗里改；
+· 不会覆盖已存在的配置文件，发现同名配置直接中止；
+· 是否写 NAT 规则、是否开 IP 转发、是否放行防火墙端口，都在弹窗里勾选；
+· 装完自动重新探测，直接进入管理界面。
+支持 Ubuntu/Debian（apt）、RHEL 系（dnf/yum）、Arch（pacman）、openSUSE（zypper）。
 
 【新增密钥】
 自动挑一个网段里没被占用的 IPv4 / IPv6 地址，生成密钥对，往 wg0.conf 追加 [Peer]，

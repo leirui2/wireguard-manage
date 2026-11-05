@@ -25,6 +25,18 @@ class ProbeError(RuntimeError):
     pass
 
 
+class ServerMissing(ProbeError):
+    """连上了，但服务器上没有可用的 WireGuard 服务端。
+
+    `installable=True` 表示具备一键安装的前提（有 root/sudo、没被权限挡住、
+    也没有 Docker 部署在跑），工具可以引导用户装一个再回来。
+    """
+
+    def __init__(self, message: str, *, installable: bool = True):
+        super().__init__(message)
+        self.installable = installable
+
+
 def _is_private_host(host: str) -> bool:
     try:
         return ipaddress.ip_address((host or "").strip()).is_private
@@ -180,7 +192,14 @@ def probe(backend: Backend, conn: dict, log) -> tuple[Backend, Deployment]:
         dep.notes.append("未找到 wg-quick：热加载会退回重启 wg-quick 服务（会短暂断开所有连接）。")
 
     if not info["conf_files"]:
-        raise ProbeError(_diagnose_no_conf(info))
+        diagnose = _diagnose_no_conf(info)
+        raw = (info.get("conf_scan_raw") or "") + " " + (info.get("conf_dir_raw") or "")
+        denied = "permission denied" in raw.lower() or "权限不够" in raw
+        sudo_ok = getattr(backend, "sudo_mode", "root") != "none"
+        # 有 root、没被权限挡住、也不是 Docker 部署 -> 可以引导一键安装服务端
+        if sudo_ok and not denied and not info["containers"]:
+            raise ServerMissing(diagnose, installable=True)
+        raise ProbeError(diagnose)
 
     manual_conf = (conn.get("conf_path") or "").strip()
     if manual_conf:

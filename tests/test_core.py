@@ -488,6 +488,218 @@ class TestSSHBackend(unittest.TestCase):
         self.assertIn("sudo 密码", res.err)
 
 
+class _ScriptedBackend:
+    """按命令子串返回预设输出的假服务器，用来验证一键安装的每一步。
+
+    匹配规则按顺序取第一条命中的，所以更具体的命令要排在前面
+    （比如 "route show default" 必须排在 "route show" 之前）。
+    """
+
+    host = "203.0.113.9"
+    sudo_mode = "password"
+    is_root = False
+    label = "fake"
+
+    def __init__(self, responses=()):
+        self.responses = list(responses)
+        self.commands: list[str] = []
+        self.stdins: list[str | None] = []
+
+    def run(self, cmd, root=False, stdin=None, timeout=25):
+        from wgmanager.backend import CmdResult
+
+        self.commands.append(cmd)
+        self.stdins.append(stdin)
+        for key, out, err, code in self.responses:
+            if key in cmd:
+                return CmdResult(out, err, code, cmd)
+        return CmdResult("", "", 0, cmd)
+
+    def close(self):
+        pass
+
+
+def _install_backend(**over):
+    from wgmanager.util import local_keypair
+
+    priv, pub = local_keypair()
+    os_release = (
+        'ID=ubuntu\nID_LIKE=debian\nVERSION_ID="22.04"\n'
+        'PRETTY_NAME="Ubuntu 22.04.4 LTS"\n'
+    )
+    base = {
+        "cat /etc/os-release": (os_release, "", 0),
+        "route show default": (
+            "default via 192.168.3.1 dev eth0 proto dhcp src 192.168.3.88\n", "", 0),
+        "ip -4 route show": (
+            "default via 192.168.3.1 dev eth0 proto dhcp src 192.168.3.88\n"
+            "10.8.0.0/24 dev wg0 proto kernel scope link src 10.8.0.1\n"
+            "192.168.3.0/24 dev eth0 proto kernel scope link src 192.168.3.88\n", "", 0),
+        "ss -lun": ("UNCONN 0 0 0.0.0.0:51820 0.0.0.0:*\n", "", 0),
+        "command -v ufw": ("", "", 1),
+        "command -v firewall-cmd": ("", "", 1),
+        "sysctl -n net.ipv4.ip_forward": ("0\n", "", 0),
+        "test -e /etc/wireguard/wg0.conf": ("NONE\n", "", 0),
+        "wg genkey": (priv + "\n", "", 0),
+        "wg pubkey": (pub + "\n", "", 0),
+        "wg show wg0 public-key": (pub + "\n", "", 0),
+        "apt-get": ("", "", 0),
+    }
+    base.update(over)
+    return _ScriptedBackend([(k, *v) for k, v in base.items()]), pub, priv
+
+
+class TestInstaller(unittest.TestCase):
+    def test_parse_os_release(self):
+        from wgmanager.installer import parse_os_release, platform_from_release
+
+        info = parse_os_release(
+            'NAME="Ubuntu"\nID=ubuntu\nID_LIKE=debian\nPRETTY_NAME="Ubuntu 22.04.4 LTS"\n'
+        )
+        self.assertEqual(info["ID"], "ubuntu")
+        self.assertEqual(info["PRETTY_NAME"], "Ubuntu 22.04.4 LTS")
+
+        ubuntu = platform_from_release(info)
+        self.assertEqual(ubuntu.family, "debian")
+        self.assertIn("apt-get install -y wireguard", ubuntu.install_cmd)
+        self.assertTrue(ubuntu.supported)
+
+        rocky = platform_from_release({"ID": "rocky", "ID_LIKE": "rhel centos fedora"})
+        self.assertEqual(rocky.family, "rhel")
+        self.assertIn("wireguard-tools", rocky.install_cmd)
+
+        arch = platform_from_release({"ID": "arch"})
+        self.assertEqual(arch.family, "arch")
+        self.assertIn("pacman", arch.install_cmd)
+
+        other = platform_from_release({"ID": "plan9"})
+        self.assertFalse(other.supported)
+        self.assertTrue(other.notes)
+
+    def test_build_plan_avoids_used_subnet_and_port(self):
+        from wgmanager.installer import Options, build_plan
+
+        backend, _pub, _priv = _install_backend()
+        plan = build_plan(backend, Options(), "203.0.113.9")
+        # 10.8.0.0/24 已被占用 -> 顺延到 10.9.0.0/24
+        self.assertEqual(plan.subnet, "10.9.0.0/24")
+        self.assertEqual(plan.server_address, "10.9.0.1/24")
+        # 51820 已被占用 -> 顺延
+        self.assertEqual(plan.listen_port, 51821)
+        self.assertEqual(plan.default_iface, "eth0")
+        self.assertEqual(plan.conf_path, "/etc/wireguard/wg0.conf")
+        self.assertTrue(any("安装 WireGuard" in s for s in plan.steps))
+
+    def test_render_conf(self):
+        from wgmanager.installer import Options, Plan, Platform, render_conf
+
+        plan = Plan(platform=Platform(name="Ubuntu"), default_iface="eth0")
+        plan.server_address = "10.9.0.1/24"
+        plan.listen_port = 51821
+        text = render_conf("PRIVKEY", plan, enable_nat=True)
+        self.assertIn("[Interface]", text)
+        self.assertIn("Address = 10.9.0.1/24", text)
+        self.assertIn("ListenPort = 51821", text)
+        self.assertIn("PrivateKey = PRIVKEY", text)
+        self.assertIn("POSTROUTING -o eth0 -j MASQUERADE", text)
+        self.assertIn("PostDown", text)
+        self.assertNotIn("SaveConfig", text)
+
+        plain = render_conf("PRIVKEY", plan, enable_nat=False)
+        self.assertNotIn("iptables", plain)
+
+    def test_refuses_to_overwrite_existing_conf(self):
+        from wgmanager.installer import Options, build_plan, run_install
+
+        backend, _pub, _priv = _install_backend(
+            **{"test -e /etc/wireguard/wg0.conf": ("EXISTS\n", "", 0)}
+        )
+        plan = build_plan(backend, Options(), "")
+        with self.assertRaises(RuntimeError) as ctx:
+            run_install(backend, plan, Options(), LOG)
+        self.assertIn("已经存在", str(ctx.exception))
+        # 一条安装命令都不能执行
+        self.assertFalse(any("apt-get" in c for c in backend.commands))
+
+    def test_install_happy_path(self):
+        from wgmanager.installer import Options, build_plan, run_install
+
+        backend, pub, priv = _install_backend()
+        opts = Options(subnet="10.55.0.0/24", listen_port=52000)
+        plan = build_plan(backend, opts, "")
+        self.assertEqual(plan.subnet, "10.55.0.0/24")
+        self.assertEqual(plan.server_address, "10.55.0.1/24")
+        self.assertEqual(plan.listen_port, 52000)
+
+        result = run_install(backend, plan, opts, LOG)
+        self.assertTrue(result.started)
+        self.assertEqual(result.public_key, pub)
+        self.assertEqual(result.conf_path, "/etc/wireguard/wg0.conf")
+
+        # 私钥只能出现在 stdin 里，绝不能出现在命令行
+        self.assertFalse(any(priv in c for c in backend.commands))
+        conf_stdin = [s for s in backend.stdins if s and "PrivateKey" in s]
+        self.assertTrue(conf_stdin)
+        self.assertIn(f"PrivateKey = {priv}", conf_stdin[0])
+        self.assertIn("Address = 10.55.0.1/24", conf_stdin[0])
+
+        joined = " ;; ".join(backend.commands)
+        self.assertIn("apt-get install -y wireguard", joined)
+        self.assertIn("systemctl enable wg-quick@", joined)
+        self.assertIn("sysctl", joined)
+
+    def test_warns_when_iface_already_exists(self):
+        from wgmanager.installer import Options, build_plan
+
+        backend, _pub, _priv = _install_backend(
+            **{"ip -br link show": ("lo UNKNOWN\neth0 UP 00:11:22:33:44:55\nwg0 UNKNOWN\n", "", 0)}
+        )
+        plan = build_plan(backend, Options(), "")
+        self.assertTrue(any("已经存在" in n for n in plan.notes), plan.notes)
+
+    def test_install_rejects_busy_port(self):
+        from wgmanager.installer import Options, build_plan
+
+        backend, _pub, _priv = _install_backend()
+        with self.assertRaises(ValueError) as ctx:
+            build_plan(backend, Options(listen_port=51820), "")
+        self.assertIn("已被占用", str(ctx.exception))
+
+    def test_unsupported_platform_aborts(self):
+        from wgmanager.installer import Options, build_plan, run_install
+
+        backend, _pub, _priv = _install_backend(
+            **{"cat /etc/os-release": ("ID=plan9\n", "", 0)}
+        )
+        plan = build_plan(backend, Options(), "")
+        self.assertFalse(plan.platform.supported)
+        with self.assertRaises(RuntimeError):
+            run_install(backend, plan, Options(), LOG)
+
+
+class TestServerMissing(unittest.TestCase):
+    def _empty_server(self, sudo_mode="password"):
+        backend = _ScriptedBackend()
+        backend.sudo_mode = sudo_mode
+        return backend
+
+    def test_missing_server_is_installable(self):
+        from wgmanager.probe import ServerMissing, probe
+
+        backend = self._empty_server("password")
+        with self.assertRaises(ServerMissing) as ctx:
+            probe(backend, {}, LOG)
+        self.assertTrue(ctx.exception.installable)
+
+    def test_permission_problem_is_not_installable(self):
+        from wgmanager.probe import ProbeError, ServerMissing, probe
+
+        backend = self._empty_server("none")
+        with self.assertRaises(ProbeError) as ctx:
+            probe(backend, {}, LOG)
+        self.assertNotIsInstance(ctx.exception, ServerMissing)
+
+
 class TestClientDownloads(unittest.TestCase):
     """下载链接只收官方来源，写错域名等于把人导到钓鱼站。"""
 
