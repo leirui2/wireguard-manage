@@ -77,10 +77,16 @@ def parse_os_release(text: str) -> dict:
     return data
 
 
+def _major_version(version: str) -> int:
+    match = re.match(r"\s*(\d+)", version or "")
+    return int(match.group(1)) if match else 0
+
+
 def platform_from_release(info: dict) -> Platform:
     distro = (info.get("ID") or "").strip().lower()
     likes = (info.get("ID_LIKE") or "").strip().lower().split()
     name = (info.get("PRETTY_NAME") or info.get("NAME") or distro).strip()
+    version = (info.get("VERSION_ID") or "").strip()
     family = "unknown"
     for candidate in [distro] + likes:
         if candidate in DEBIAN_IDS:
@@ -98,25 +104,88 @@ def platform_from_release(info: dict) -> Platform:
 
     plat = Platform(distro_id=distro, name=name, family=family)
     if family == "debian":
-        plat.install_cmd = _root_chain(
-            "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard"
+        major = _major_version(version)
+        too_old = (distro == "debian" and 0 < major < 11) or (
+            distro == "ubuntu" and 0 < major < 20
         )
+        if too_old:
+            # 这些版本的主仓库里没有能用的 wireguard 包（Debian 10 在 backports，
+            # Ubuntu 18.04 的内核 4.15 根本没有模块），自动装必然失败在半路。
+            plat.install_cmd = ""
+            if distro == "debian":
+                plat.notes.append(
+                    f"Debian {version} 的内核 4.19 不自带 WireGuard 模块，"
+                    "官方要求先启用 backports 再安装（bullseye 及更新版本才开箱可用），"
+                    "工具不会自动改软件源。\n"
+                    "手动做法：加一行 `deb http://deb.debian.org/debian "
+                    f"{'buster' if major == 10 else 'stretch'}-backports main` 到 "
+                    "/etc/apt/sources.list，`apt update` 后安装 wireguard 并升级内核。\n"
+                    "如果内核已经升到 5.6 以上，也可以直接 `apt install wireguard` 后回来连接。"
+                )
+            else:
+                plat.notes.append(
+                    f"Ubuntu {version} 的内核（4.15）不自带 WireGuard 模块，"
+                    "需要先安装 HWE 内核（如 linux-generic-hwe-18.04）。\n"
+                    "升级内核并重启后，`apt install wireguard` 再回来连接即可。"
+                )
+        else:
+            plat.install_cmd = _root_chain(
+                "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard"
+            )
     elif family == "rhel":
-        plat.install_cmd = _root_chain(
-            "dnf install -y wireguard-tools || yum install -y wireguard-tools"
-        )
-        plat.notes.append(
-            "RHEL 系如果内核没有自带 wireguard 模块，还需要 EPEL 里的 kmod-wireguard；"
-            "装完启动失败时按报错补装。"
-        )
+        major = _major_version(version)
+        if distro == "fedora" or major >= 9:
+            # RHEL 9 / CentOS Stream 9 / Rocky 9 / Alma 9 / Fedora：
+            # wireguard-tools 在官方 AppStream 仓库，内核 5.14+ 自带模块，不需要 EPEL。
+            plat.install_cmd = _root_chain(
+                "dnf install -y wireguard-tools || yum install -y wireguard-tools"
+            )
+        elif major == 8:
+            # RHEL 8 系内核 4.18 没有 wireguard 模块，wireguard-tools 只在 EPEL。
+            # 官方给的做法就是 EPEL + ELRepo 的 kmod-wireguard + wireguard-tools。
+            plat.install_cmd = _root_chain(
+                "dnf install -y "
+                "https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm "
+                "https://www.elrepo.org/elrepo-release-8.el8.elrepo.noarch.rpm"
+                " && dnf install -y kmod-wireguard wireguard-tools"
+            )
+            plat.notes.append(
+                "RHEL / CentOS / Rocky / Alma 8 的内核 4.18 不含 WireGuard 模块，"
+                "需要 ELRepo 的 kmod-wireguard；安装过程会额外引入 EPEL 与 ELRepo 两个第三方仓库。"
+            )
+        elif major and major <= 7:
+            plat.install_cmd = ""
+            plat.notes.append(
+                f"{name} 的内核 3.10 不含 WireGuard 模块，且 CentOS 7 已于 2024-06 停止维护、"
+                "软件源多已下线，不做自动安装。\n"
+                "手动做法：安装 epel-release 与 elrepo-release，"
+                "再 exec `yum install -y kmod-wireguard wireguard-tools`，然后重新连接。"
+            )
+        else:
+            # 版本号读不出来，按新版本处理（先试官方仓库，失败再试 yum）
+            plat.install_cmd = _root_chain(
+                "dnf install -y wireguard-tools || yum install -y wireguard-tools"
+            )
     elif family == "arch":
-        plat.install_cmd = "pacman -Sy --noconfirm wireguard-tools"
+        # Arch 官方明确不支持部分升级：绝不能用 pacman -Sy 单独装包，
+        # 否则可能把 glibc 之类的依赖升一半，连 sudo 都起不来。
+        plat.install_cmd = "pacman -S --needed --noconfirm wireguard-tools"
+        plat.notes.append(
+            "Arch 不支持部分升级，这里只用 pacman -S（不刷新数据库）。"
+            "如果提示找不到包或下载 404，请先在服务器上手动执行 pacman -Syu，再重试。"
+        )
     elif family == "suse":
         plat.install_cmd = "zypper --non-interactive install wireguard-tools"
     else:
         plat.notes.append(
-            "没能识别发行版，无法自动装包。可以先手动执行 "
-            "`apt install wireguard` 或 `dnf install wireguard-tools`，再回来连接。"
+            "没能识别发行版，无法自动装包。可先手动安装：\n"
+            "  Debian/Ubuntu   apt install wireguard\n"
+            "  RHEL/Fedora     dnf install wireguard-tools\n"
+            "  Arch            pacman -S wireguard-tools\n"
+            "  openSUSE        zypper install wireguard-tools\n"
+            "  Alpine          apk add -U wireguard-tools"
+            "（3.19 之前还要装 wireguard-tools-wg-quick 子包）\n"
+            "装好后再重新连接，就能直接管理已有部署。"
         )
     return plat
 
@@ -158,6 +227,7 @@ class Plan:
     endpoint_host: str = ""
     default_iface: str = ""
     firewall: str = ""          # ufw | firewalld | ""
+    nat_method: str = ""        # iptables | firewalld | ""
     forward_enabled: bool = False
     steps: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -241,17 +311,50 @@ def _default_iface(target: Backend) -> str:
     return ""
 
 
-def _firewall(target: Backend) -> str:
-    ufw = target.run("command -v ufw", timeout=10)
-    if ufw.ok and ufw.out.strip():
+def _tool_paths(target: Backend, names: list[str]) -> dict[str, bool]:
+    """一次往返确认多个命令是否存在。
+
+    不能直接用 `command -v`：非 root 用户的 PATH 里通常没有 /usr/sbin，
+    而 iptables / firewall-cmd 恰恰都装在那里，会误判成「没装」。
+    """
+    checks = " ".join(
+        f'if command -v {name} >/dev/null 2>&1 || [ -x /usr/sbin/{name} ] '
+        f'|| [ -x /sbin/{name} ]; then echo "HAVE:{name}"; fi;'
+        for name in names
+    )
+    res = target.run("sh -c " + shlex.quote(checks), root=True, timeout=20)
+    found: dict[str, bool] = {}
+    for line in (res.out or "").splitlines():
+        line = line.strip()
+        if line.startswith("HAVE:"):
+            found[line[5:].strip()] = True
+    return found
+
+
+def _firewall(target: Backend, tools: dict[str, bool]) -> str:
+    if tools.get("ufw"):
         status = target.run("ufw status", root=True, timeout=15)
         if "status: active" in (status.out or "").lower():
             return "ufw"
-    fwd = target.run("command -v firewall-cmd", timeout=10)
-    if fwd.ok and fwd.out.strip():
+    if tools.get("firewall-cmd"):
         state = target.run("firewall-cmd --state", root=True, timeout=15)
         if "running" in (state.out or "").lower():
             return "firewalld"
+    return ""
+
+
+def _nat_method(tools: dict[str, bool], firewall: str) -> str:
+    """决定用谁来配 NAT。
+
+    firewalld 在跑就必须交给它管：Red Hat 明确要求 firewalld / nftables / iptables
+    只用一个，混着写规则会被 firewalld reload 清掉。
+    否则用 iptables（Debian/Ubuntu/openSUSE 的标准做法）。
+    两者都没有就不写 PostUp —— 写了也必然让 wg-quick up 失败。
+    """
+    if firewall == "firewalld" and tools.get("firewall-cmd"):
+        return "firewalld"
+    if tools.get("iptables"):
+        return "iptables"
     return ""
 
 
@@ -287,7 +390,9 @@ def build_plan(target: Backend, options: Options, endpoint_host: str = "") -> Pl
     plan.subnet, plan.server_address = _pick_subnet(target, options.subnet)
     plan.listen_port = _pick_port(target, options.listen_port)
     plan.default_iface = _default_iface(target)
-    plan.firewall = _firewall(target)
+    tools = _tool_paths(target, ["iptables", "firewall-cmd", "nft", "ufw"])
+    plan.firewall = _firewall(target, tools)
+    plan.nat_method = _nat_method(tools, plan.firewall)
     plan.forward_enabled = _forward_enabled(target)
 
     net = ipaddress.ip_network(plan.subnet)
@@ -313,24 +418,40 @@ def build_plan(target: Backend, options: Options, endpoint_host: str = "") -> Pl
         f"启用并启动 wg-quick@{plan.iface}",
     ]
     if options.enable_nat:
-        plan.steps.insert(
-            -1,
-            f"写入 NAT 规则：客户端流量经 {plan.default_iface or '默认网卡'} 出去"
-            if plan.default_iface
-            else "写入 NAT 规则（未能识别默认网卡，请在配置里手工改 %i 之外的出口）",
-        )
+        if plan.nat_method == "iptables":
+            plan.steps.insert(
+                -1,
+                f"写入 NAT 规则（iptables，PostUp）：客户端流量经 {plan.default_iface} 出去"
+                if plan.default_iface
+                else "写入 NAT 规则（iptables，未能识别默认网卡，配置里会留占位注释）",
+            )
+        elif plan.nat_method == "firewalld":
+            plan.steps.insert(-1, "在 firewalld 里开启 masquerade（实现 NAT）")
+        else:
+            plan.steps.insert(-1, "跳过 NAT：本机既没有 iptables 命令，firewalld 也没在运行")
     if options.open_firewall and plan.firewall:
         plan.steps.append(
             f"在 {plan.firewall} 放行 UDP {plan.listen_port}"
         )
 
-    if not plat.supported:
-        plan.notes.extend(plat.notes)
+    # 无论支持与否都要把注意事项带出来：Debian 10 的 backports、
+    # RHEL 8 的 EPEL、Arch 的 pacman -Syu 提示，漏掉就会让人踩坑。
+    plan.notes.extend(plat.notes)
     if plan.forward_enabled and options.enable_forward:
         pass
-    if not plan.default_iface and options.enable_nat:
+    if options.enable_nat and plan.nat_method == "iptables" and not plan.default_iface:
         plan.notes.append(
             "没识别到默认出口网卡，NAT 规则里的 -o 参数会留空占位，可能需要手工改。"
+        )
+    if options.enable_nat and plan.nat_method == "firewalld":
+        plan.notes.append(
+            "这台机器在跑 firewalld，NAT 用 firewall-cmd 开启 masquerade（永久生效，"
+            "以后关掉接口也不会撤销）。"
+        )
+    if options.enable_nat and not plan.nat_method:
+        plan.notes.append(
+            "这台机器既没有 iptables 命令、firewalld 也没在运行，无法自动配置 NAT："
+            "客户端能连上但上不了网。装完需要自己用 nft 或 firewalld 配 masquerade。"
         )
     if plan.firewall and not options.open_firewall:
         plan.notes.append(
@@ -354,7 +475,12 @@ def render_conf(
     enable_nat: bool = True,
     enable_forward: bool = True,
 ) -> str:
-    """生成标准的 wg-quick 配置。未开启 NAT 时不写 PostUp/PostDown。"""
+    """生成标准的 wg-quick 配置。
+
+    NAT 只在本机确实有 iptables 时才写成 PostUp：PostUp 由 wg-quick 用 bash 执行，
+    任何一条返回非 0 都会让整个 `wg-quick up` 失败，接口起不来。
+    没 iptables 的机器（RHEL 9 精简安装、树莓派 Lite 等）宁可不写，也不能写错。
+    """
     lines = [
         "# 由 WireGuard 密钥管理工具自动创建",
         f"# 创建时间：{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')}",
@@ -363,7 +489,7 @@ def render_conf(
         f"ListenPort = {plan.listen_port}",
         f"PrivateKey = {private_key}",
     ]
-    if enable_nat and plan.default_iface:
+    if enable_nat and plan.nat_method == "iptables" and plan.default_iface:
         out = plan.default_iface
         lines += [
             "PostUp = iptables -A FORWARD -i %i -j ACCEPT; "
@@ -373,17 +499,39 @@ def render_conf(
             f"iptables -D FORWARD -o %i -j ACCEPT; "
             f"iptables -t nat -D POSTROUTING -o {out} -j MASQUERADE",
         ]
-    elif enable_nat:
+    elif enable_nat and plan.nat_method == "iptables":
         lines += [
             "# 未识别默认出口网卡，下面是占位规则，请手工把 eth0 改成实际网卡后再启用",
             "# PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE",
             "# PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE",
         ]
+    elif enable_nat and plan.nat_method == "firewalld":
+        lines.append("# NAT 由 firewalld 的 masquerade 负责，见安装日志")
+    elif enable_nat:
+        lines.append("# 本机没有 iptables，未写入 NAT 规则；客户端只能访问服务器本身")
     lines.append("")
     return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------- 执行
+
+
+def _kmod_hint(family: str) -> str:
+    if family == "debian":
+        return (
+            "Debian 10 及更早版本的内核 4.19 不带该模块：需要启用 backports 装上较新的内核，"
+            "或改装 DKMS 版本；Ubuntu 则要先装 HWE 内核（如 linux-generic-hwe-22.04）。"
+        )
+    if family == "rhel":
+        return (
+            "RHEL / CentOS / Rocky / Alma 8 及更早需要 ELRepo 的 kmod-wireguard，"
+            "或者 wireguard-dkms。"
+        )
+    if family == "arch":
+        return "可以试试 wireguard-dkms + 对应内核的 headers 包。"
+    if family == "suse":
+        return "可以试试 wireguard-kmp-default 之类与内核匹配的模块包。"
+    return "可以试着装 wireguard-dkms，或把内核升级到 5.6 以上。"
 
 
 def run_install(
@@ -423,7 +571,19 @@ def run_install(
         )
     log("WireGuard 安装完成")
 
-    # 3) 生成服务端密钥（私钥只走 stdin，不进命令行）
+    # 3) 内核模块校验：包只是用户态工具，内核没有 wireguard 模块照样起不来。
+    #    这一步放在写配置之前，失败就停手，服务器网络不受任何影响。
+    mod = target.run("modprobe wireguard", root=True, timeout=60)
+    if not mod.ok:
+        raise RuntimeError(
+            "WireGuard 软件包已安装，但这台机器的内核没有 wireguard 模块，"
+            "写配置也起不来，已在此停住（没有写入任何配置、没有启动服务、没动防火墙）。\n\n"
+            + _kmod_hint(plan.platform.family)
+            + f"\n\n具体报错：{(mod.err or mod.out).strip()[:400]}"
+        )
+    log("内核 wireguard 模块加载正常")
+
+    # 4) 生成服务端密钥（私钥只走 stdin，不进命令行）
     gen = target.run("wg genkey", root=True, timeout=20)
     private_key = (gen.out or "").strip().splitlines()
     private_key = private_key[-1].strip() if private_key else ""
@@ -436,7 +596,7 @@ def run_install(
     result.public_key = public_key
     log(f"已生成服务端密钥，公钥 {public_key[:12]}…")
 
-    # 4) 写配置：先落临时文件，再以 root 安装成 600
+    # 5) 写配置：先落临时文件，再以 root 安装成 600
     conf_text = render_conf(private_key, plan, enable_nat=options.enable_nat,
                             enable_forward=options.enable_forward)
     token = secrets.token_hex(6)
@@ -456,7 +616,7 @@ def run_install(
         raise RuntimeError(f"写入 {plan.conf_path} 失败：{moved.err.strip()}")
     log(f"配置已写入 {plan.conf_path}（权限 600）")
 
-    # 5) IP 转发
+    # 6) IP 转发
     if options.enable_forward and not plan.forward_enabled:
         sysctl_tmp = f"/tmp/.wgmgr_sysctl_{token}.conf"
         sysctl_text = "net.ipv4.ip_forward = 1\n"
@@ -479,7 +639,27 @@ def run_install(
         else:
             result.warnings.append("写 sysctl 配置失败，IP 转发未开启")
 
-    # 6) 启动服务
+    # 7) NAT：firewalld 场景交给 firewalld 管（Red Hat 要求别和 iptables 混用）
+    if options.enable_nat and plan.nat_method == "firewalld":
+        nat = target.run(
+            _root_chain("firewall-cmd --permanent --add-masquerade && firewall-cmd --reload"),
+            root=True,
+            timeout=90,
+        )
+        if nat.ok:
+            log("已在 firewalld 开启 masquerade")
+        else:
+            result.warnings.append(
+                "firewalld 开启 masquerade 失败，客户端可能上不了网："
+                + (nat.err.strip() or nat.out.strip())[-300:]
+            )
+    elif options.enable_nat and not plan.nat_method:
+        result.warnings.append(
+            "本机没有 iptables 命令、firewalld 也没在运行，NAT 未配置："
+            "客户端能连上服务器，但访问不了互联网。"
+        )
+
+    # 8) 启动服务
     start = target.run(
         _root_chain(
             f"systemctl enable wg-quick@{_q(plan.iface)} && "
@@ -502,7 +682,7 @@ def run_install(
     result.started = True
     log(f"wg-quick@{plan.iface} 已启动")
 
-    # 7) 可选：放行防火墙
+    # 9) 可选：放行防火墙
     if options.open_firewall and plan.firewall:
         if plan.firewall == "ufw":
             fw = target.run(f"ufw allow {plan.listen_port}/udp", root=True, timeout=30)
@@ -527,7 +707,7 @@ def run_install(
             "客户端可能连不上。需要的话可手动放行。"
         )
 
-    if options.enable_nat and not plan.default_iface:
+    if options.enable_nat and plan.nat_method == "iptables" and not plan.default_iface:
         result.warnings.append(
             "未识别默认出口网卡，NAT 规则没有写入，客户端只能访问服务器本身。"
         )

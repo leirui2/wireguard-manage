@@ -93,6 +93,10 @@ python -m venv .build-venv
 
 连上去发现服务器是个「裸机」时，工具不会只丢一句"没找到配置文件"，而是弹出安装方案：
 
+![一键安装服务端](build_assets/install_dialog.png)
+
+> 上图是真实的对话框（Debian 12 环境）。下面以 Ubuntu 为例展示同样的内容：
+
 ```
 检测到 Ubuntu 22.04.4 LTS，服务器上还没有 WireGuard 服务端
 
@@ -119,12 +123,13 @@ VPN 网段：  [10.9.0.0/24]    服务端会占 .1，客户端从这里分配
 
 | 步骤 | 说明 |
 |---|---|
-| 装包 | 按发行版选命令：`apt` / `dnf·yum` / `pacman` / `zypper` |
+| 装包 | 按发行版和版本选命令：`apt` / `dnf·yum` / `pacman` / `zypper`，命令对过官方文档 |
+| 验模块 | `modprobe wireguard`，内核没有模块就当场停手，不写配置 |
 | 选参数 | 自动挑一个**没被占用**的网段和 UDP 端口，撞车就顺延；也可手动改 |
 | 生成密钥 | `wg genkey`，私钥只写进配置文件（600），**不进命令行也不进日志** |
-| 写配置 | 标准 `wg-quick` 格式，含 PostUp/PostDown 的 NAT 规则 |
+| 写配置 | 标准 `wg-quick` 格式；NAT 按探测结果选 iptables / firewalld / 不写 |
 | 开转发 | 写 `/etc/sysctl.d/99-wireguard.conf`，重启后依然生效 |
-| 起服务 | `systemctl enable --now wg-quick@wg0`，然后回读公钥校验 |
+| 起服务 | `systemctl enable` + `restart`，然后回读公钥校验 |
 
 ### 它不会做什么
 
@@ -135,19 +140,37 @@ VPN 网段：  [10.9.0.0/24]    服务端会占 .1，客户端从这里分配
 
 ### 支持哪些系统
 
-| 系统 | 装包方式 | 状态 |
+下表的命令逐条对过官方文档（WireGuard 官网 Installation 页、Red Hat 文档、各发行版仓库元数据）：
+
+| 系统 | 装包命令 | 说明 |
 |---|---|---|
-| Ubuntu / **Debian** / Linux Mint / Kali / Deepin / UOS / Armbian / Raspberry Pi OS | `apt-get install wireguard` | Ubuntu 22.04 **已实测**，同一条命令覆盖整个 Debian 系 |
-| RHEL / CentOS / Rocky / AlmaLinux / Fedora / Oracle Linux / openEuler / 麒麟 / Anolis | `dnf` 或 `yum install wireguard-tools` | 代码支持，**未在真机验证**；可能还要 EPEL 的 `kmod-wireguard` |
-| Arch / Manjaro / EndeavourOS | `pacman -S wireguard-tools` | 代码支持，未实测 |
-| openSUSE / SLES | `zypper install wireguard-tools` | 代码支持，未实测 |
+| Ubuntu 20.04+ / Debian 11+ / Mint 21+ / Kali / Deepin / UOS / Armbian / 树莓派 OS | `apt-get install wireguard` | 内核 5.10+ 自带模块，开箱可用 |
+| RHEL 9 / Rocky 9 / Alma 9 / CentOS Stream 9·10 / Fedora | `dnf install wireguard-tools` | 包在官方 **AppStream** 仓库，内核 5.14 自带模块，**不需要 EPEL** |
+| RHEL / Rocky / Alma / CentOS 8 | 先装 EPEL + ELRepo，再装 `kmod-wireguard` + `wireguard-tools` | 内核 4.18 没有模块，`wireguard-tools` 也只在 EPEL |
+| Arch / Manjaro / EndeavourOS | `pacman -S --needed wireguard-tools` | **不做部分升级**：`pacman -Sy` 会升坏 glibc/sudo，官方明令禁止 |
+| openSUSE Leap / SLES | `zypper install wireguard-tools` | 在 main/oss 仓库 |
+| Debian 10 及更早、Ubuntu 18.04 | — | **明确拒绝**：包在 backports / 内核 4.15 没模块，自动装必然失败在半路 |
+| CentOS 7 / RHEL 7 | — | **明确拒绝**：已 EOL，软件源多已下线，内核 3.10 还要 ELRepo |
 | Alpine / Devuan / Gentoo / Void（非 systemd） | — | **明确拒绝**：起不了服务，宁可不装也不留半成品 |
-| 其它 / 识别不出来 | — | 明确拒绝，并给出手动命令 |
+| 其它 / 识别不出来 | — | 明确拒绝，并逐条给出手动命令 |
 
-判据是 `/etc/os-release` 里的 `ID` 和 `ID_LIKE`，不靠猜。另外会检查 `/proc/1/comm` 确认
-systemd 真的是 PID 1 —— 在容器里跑的时候 `systemctl` 可能装了但用不了，这种情况也会被拦下。
+判据是 `/etc/os-release` 里的 `ID`、`ID_LIKE`、`VERSION_ID`，不靠猜发行版名字。
+另外会检查 `/proc/1/comm` 确认 systemd 真的是 PID 1 —— 容器里 `systemctl` 可能装了但用不了，也会被拦下。
 
-> Debian 10 及更早的内核没带 WireGuard 模块，需要先开 backports；Debian 11+ 直接装即可。
+**装完还会验一次内核模块**：`modprobe wireguard` 失败就立刻停手，不写配置、不启动服务。
+这一步比猜版本号可靠 —— 有人把 Debian 10 的内核升到 5.10，照样能直接装。
+
+### NAT 怎么配
+
+不同系统上"能不能写 `iptables`"差别很大，写错会让 `wg-quick up` 直接失败（PostUp 任一命令返回非 0 就中止）：
+
+| 探测结果 | NAT 怎么处理 |
+|---|---|
+| firewalld 在运行 | 用 `firewall-cmd --permanent --add-masquerade`，**不碰 iptables**（Red Hat 要求两者只用一个） |
+| 有 `iptables` 命令 | 写进配置的 `PostUp` / `PostDown`，随接口启停自动回收规则 |
+| 两者都没有 | **不写 PostUp**，配置里注明原因，并提示需要自己配 masquerade |
+
+> RHEL 9 / 树莓派 OS Lite 这类精简系统默认没有 `iptables` 命令，硬写 PostUp 会让接口起不来 —— 所以是探测后再决定，不是固定写死。
 
 ### 前提条件
 
@@ -155,7 +178,8 @@ systemd 真的是 PID 1 —— 在容器里跑的时候 `systemctl` 可能装了
 2. 服务器能装上包（要能访问软件源）
 3. **云厂商安全组要另外放行 UDP 端口**——这个工具改不到你的云控制台
 
-> RHEL / CentOS 系如果内核没带 WireGuard 模块，还需要 EPEL 的 `kmod-wireguard`，装完启动失败时按报错补装。
+> 支持矩阵里的命令是按官方文档核对的，除 Ubuntu 22.04 外**没有在真机上装过**。
+> 第一次在某个发行版上使用时，建议先在测试机跑一遍，把「即将执行」和报错日志留下来。
 
 ---
 
@@ -306,7 +330,7 @@ wireguard-manage/
 │   ├── service.py             # 增删改查、备份/热加载/回滚
 │   ├── util.py                # 密钥生成、IP 分配、二维码、格式化
 │   └── downloads.py           # 官方客户端下载地址
-├── tests/test_core.py         # 47 个单元测试（含模拟服务器）
+├── tests/test_core.py         # 58 个单元测试（含模拟服务器）
 ├── build_assets/              # 图标、版本信息、界面截图
 ├── wireguard-manager.spec     # PyInstaller 打包配置
 ├── requirements.txt           # 运行时依赖
@@ -379,7 +403,7 @@ PyInstaller 打包的程序没有代码签名，容易被误报。添加信任�
 python -m unittest discover -s tests -v
 ```
 
-测试使用内存模拟服务器（`DemoBackend`），不依赖真实环境，覆盖：配置保真解析、部署探测、增删改密钥、地址冲突与非法地址拒绝、改注释不影响其它行、重名拒绝、手动指定 IP、二维码 PNG 与定位角完整性、二维码图片不被回收、下载链接只收官方域名、一键安装的发行版识别与命令构造（含拒绝覆盖已有配置）、热加载失败自动回滚、sudo 命令构造、窗口居中。
+测试使用内存模拟服务器（`DemoBackend`），不依赖真实环境，覆盖：配置保真解析、部署探测、增删改密钥、地址冲突与非法地址拒绝、改注释不影响其它行、重名拒绝、手动指定 IP、二维码 PNG 与定位角完整性、二维码图片不被回收、下载链接只收官方域名、一键安装的发行版识别与命令构造（Arch 禁止部分升级、RHEL 8 走 EPEL+ELRepo、RHEL 7 与 Debian 10 拒绝）、NAT 方式按 iptables/firewalld 分流、内核模块缺失时中止、拒绝覆盖已有配置、热加载失败自动回滚、sudo 命令构造、窗口居中。
 
 界面里勾选「演示模式」也能不接服务器直接试用全部流程。
 

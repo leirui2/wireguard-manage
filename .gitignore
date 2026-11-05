@@ -38,6 +38,14 @@ WireGuard密钥管理工具.spec
 # 验证用的原始截图（4MB BMP，仓库里只留压缩后的 PNG）
 build_assets/*.bmp
 
+# 调试过程中生成的临时截图，没有文档用途
+build_assets/app_preview.png
+build_assets/dl_dialog.png
+build_assets/exe_v2.png
+build_assets/exe_v3.png
+build_assets/qr_demo.png
+build_assets/qr_dialog.png
+
 # ===============================================================
 # 编辑器 / 系统垃圾
 # ===============================================================

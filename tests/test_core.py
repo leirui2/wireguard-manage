@@ -528,6 +528,8 @@ def _install_backend(**over):
         'PRETTY_NAME="Ubuntu 22.04.4 LTS"\n'
     )
     base = {
+        # 一次往返的 NAT 工具探测：默认按「有 iptables、没 firewalld」的普通 Linux 服务器算
+        "sh -c 'if command -v iptables": ("HAVE:iptables\n", "", 0),
         "cat /etc/os-release": (os_release, "", 0),
         "route show default": (
             "default via 192.168.3.1 dev eth0 proto dhcp src 192.168.3.88\n", "", 0),
@@ -595,7 +597,8 @@ class TestInstaller(unittest.TestCase):
     def test_render_conf(self):
         from wgmanager.installer import Options, Plan, Platform, render_conf
 
-        plan = Plan(platform=Platform(name="Ubuntu"), default_iface="eth0")
+        plan = Plan(platform=Platform(name="Ubuntu"), default_iface="eth0",
+                    nat_method="iptables")
         plan.server_address = "10.9.0.1/24"
         plan.listen_port = 51821
         text = render_conf("PRIVKEY", plan, enable_nat=True)
@@ -704,6 +707,147 @@ class TestInstaller(unittest.TestCase):
             run_install(backend, plan, Options(), LOG)
         # 一条安装命令都不该执行
         self.assertFalse(any("apt-get" in c for c in backend.commands))
+
+    # ---- 以下按各发行版官方文档核对过命令 -------------------------------
+
+    def test_arch_never_does_partial_upgrade(self):
+        """Arch 官方明确不支持部分升级：pacman -Sy <pkg> 可能升坏 glibc/sudo。"""
+        from wgmanager.installer import parse_os_release, platform_from_release
+
+        plat = platform_from_release(
+            parse_os_release('ID=arch\nPRETTY_NAME="Arch Linux"\n')
+        )
+        self.assertEqual(plat.family, "arch")
+        self.assertIn("pacman -S --needed --noconfirm wireguard-tools", plat.install_cmd)
+        self.assertNotIn("-Sy", plat.install_cmd)
+        self.assertTrue(any("Syu" in n for n in plat.notes), plat.notes)
+
+    def test_rhel9_and_fedora_use_appstream_without_epel(self):
+        """RHEL 9 / Rocky 9 / Alma 9 / Fedora：wireguard-tools 在官方仓库，内核自带模块。"""
+        from wgmanager.installer import parse_os_release, platform_from_release
+
+        for raw in (
+            'ID="rhel"\nVERSION_ID="9.4"\n',
+            'ID="rocky"\nVERSION_ID="9.3"\n',
+            'ID="almalinux"\nVERSION_ID="9.3"\n',
+            'ID="centos"\nVERSION_ID="10"\n',
+            'ID="fedora"\nVERSION_ID="41"\n',
+        ):
+            with self.subTest(raw=raw.splitlines()[0]):
+                plat = platform_from_release(parse_os_release(raw))
+                self.assertEqual(plat.family, "rhel")
+                self.assertIn("wireguard-tools", plat.install_cmd)
+                self.assertNotIn("epel", plat.install_cmd.lower())
+                self.assertNotIn("kmod", plat.install_cmd)
+
+    def test_rhel8_pulls_epel_and_elrepo_kmod(self):
+        """RHEL 8 系内核 4.18 没有模块，wireguard-tools 也只在 EPEL。"""
+        from wgmanager.installer import parse_os_release, platform_from_release
+
+        plat = platform_from_release(parse_os_release('ID="rocky"\nVERSION_ID="8.9"\n'))
+        self.assertIn("epel-release-latest-8", plat.install_cmd)
+        self.assertIn("elrepo-release-8", plat.install_cmd)
+        self.assertIn("kmod-wireguard", plat.install_cmd)
+        self.assertTrue(any("EPEL" in n for n in plat.notes), plat.notes)
+
+    def test_rhel7_is_not_automated(self):
+        """CentOS 7 已 EOL、源多已下线，自动装必然半途失败。"""
+        from wgmanager.installer import parse_os_release, platform_from_release
+
+        plat = platform_from_release(parse_os_release('ID="centos"\nVERSION_ID="7"\n'))
+        self.assertFalse(plat.supported)
+        self.assertTrue(any("停止维护" in n for n in plat.notes), plat.notes)
+
+    def test_old_debian_and_ubuntu_are_not_automated(self):
+        """Debian 10 的包在 backports、Ubuntu 18.04 内核 4.15 没模块，自动装会失败在半路。"""
+        from wgmanager.installer import parse_os_release, platform_from_release
+
+        buster = platform_from_release(
+            parse_os_release('ID=debian\nVERSION_ID="10"\nPRETTY_NAME="Debian 10"\n')
+        )
+        self.assertFalse(buster.supported)
+        self.assertTrue(any("backports" in n for n in buster.notes), buster.notes)
+
+        bionic = platform_from_release(
+            parse_os_release('ID=ubuntu\nVERSION_ID="18.04"\nPRETTY_NAME="Ubuntu 18.04"\n')
+        )
+        self.assertFalse(bionic.supported)
+        self.assertTrue(any("HWE" in n for n in bionic.notes), bionic.notes)
+
+        # 新版仍然自动安装
+        for raw in ('ID=debian\nVERSION_ID="11"\n', 'ID=ubuntu\nVERSION_ID="20.04"\n'):
+            with self.subTest(raw=raw.splitlines()[0]):
+                plat = platform_from_release(parse_os_release(raw))
+                self.assertTrue(plat.supported)
+                self.assertIn("apt-get install -y wireguard", plat.install_cmd)
+
+    def test_platform_notes_reach_the_plan(self):
+        """平台提示必须带进方案：以前只有「不支持」时才 extend，Arch/RHEL8 的提示全被吞了。"""
+        from wgmanager.installer import Options, build_plan
+
+        backend, _pub, _priv = _install_backend(**{
+            "cat /etc/os-release": ('ID=arch\nPRETTY_NAME="Arch Linux"\n', "", 0),
+        })
+        plan = build_plan(backend, Options(), "")
+        self.assertTrue(any("Syu" in n for n in plan.notes), plan.notes)
+
+    def test_firewalld_takes_over_nat(self):
+        """firewalld 在跑就必须交给它管，不能和 iptables 混着写规则。"""
+        from wgmanager.installer import Options, build_plan, render_conf, run_install
+
+        backend, _pub, _priv = _install_backend(**{
+            "sh -c 'if command -v iptables": ("HAVE:firewall-cmd\n", "", 0),
+            "firewall-cmd --state": ("running\n", "", 0),
+        })
+        plan = build_plan(backend, Options(), "203.0.113.9")
+        self.assertEqual(plan.firewall, "firewalld")
+        self.assertEqual(plan.nat_method, "firewalld")
+
+        text = render_conf("PRIVKEY", plan, enable_nat=True)
+        self.assertNotIn("iptables", text)
+        self.assertIn("firewalld", text)
+
+        result = run_install(backend, plan, Options(), LOG)
+        self.assertTrue(result.started)
+        self.assertTrue(any("--add-masquerade" in c for c in backend.commands),
+                        backend.commands)
+
+    def test_no_iptables_no_firewalld_skips_postup(self):
+        """没有 iptables 还硬写 PostUp，会让 wg-quick up 直接失败、接口起不来。"""
+        from wgmanager.installer import Options, build_plan, render_conf, run_install
+
+        backend, _pub, _priv = _install_backend(**{
+            "sh -c 'if command -v iptables": ("", "", 0),
+        })
+        plan = build_plan(backend, Options(), "")
+        self.assertEqual(plan.nat_method, "")
+        self.assertFalse(plan.firewall)
+
+        text = render_conf("PRIVKEY", plan, enable_nat=True)
+        self.assertNotIn("PostUp", text)
+        self.assertNotIn("POSTROUTING", text)
+        self.assertNotIn("MASQUERADE", text)
+
+        result = run_install(backend, plan, Options(), LOG)
+        self.assertTrue(result.started)
+        self.assertTrue(any("NAT 未配置" in w for w in result.warnings), result.warnings)
+
+    def test_missing_kernel_module_aborts_before_writing(self):
+        """包装上了但内核没模块，必须在写配置前停手，别把服务器留成半装状态。"""
+        from wgmanager.installer import Options, build_plan, run_install
+
+        backend, _pub, _priv = _install_backend(**{
+            "modprobe wireguard": (
+                "", "modprobe: FATAL: Module wireguard not found in directory /lib/modules/4.19.0", 1),
+        })
+        plan = build_plan(backend, Options(), "")
+        with self.assertRaises(RuntimeError) as ctx:
+            run_install(backend, plan, Options(), LOG)
+        self.assertIn("内核没有 wireguard 模块", str(ctx.exception))
+        self.assertIn("backports", str(ctx.exception))
+        # 没写配置、没启动服务
+        self.assertFalse(any("PrivateKey" in (s or "") for s in backend.stdins))
+        self.assertFalse(any("systemctl enable" in c for c in backend.commands))
 
 
 class TestServerMissing(unittest.TestCase):

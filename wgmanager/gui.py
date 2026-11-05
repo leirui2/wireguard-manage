@@ -1255,7 +1255,7 @@ class InstallDialog:
 
         self.subnet = tk.StringVar(value=plan.subnet)
         self.port = tk.StringVar(value=str(plan.listen_port))
-        self.nat = tk.BooleanVar(value=bool(plan.default_iface))
+        self.nat = tk.BooleanVar(value=bool(plan.nat_method))
         self.forward = tk.BooleanVar(value=True)
         self.firewall = tk.BooleanVar(value=False)
 
@@ -1275,16 +1275,22 @@ class InstallDialog:
 
         ttk.Label(frame, text="出口网卡：", anchor="e", width=12).grid(
             row=4, column=0, sticky="e", pady=4)
-        ttk.Label(frame, text=plan.default_iface or "（未识别，将不写 NAT 规则）").grid(
+        ttk.Label(frame, text=plan.default_iface or "（未识别）").grid(
             row=4, column=1, sticky="w", pady=4)
         if plan.firewall:
             ttk.Label(frame, text=f"已启用 {plan.firewall}", foreground="#a05000").grid(
                 row=4, column=2, columnspan=2, sticky="w", padx=(10, 0))
 
+        nat_text = {
+            "iptables": "允许客户端通过本机上网（写 iptables NAT 规则）",
+            "firewalld": "允许客户端通过本机上网（在 firewalld 开启 masquerade）",
+        }.get(plan.nat_method, "允许客户端通过本机上网（未检测到 iptables，需自行配置 NAT）")
+
         checks = ttk.Frame(frame)
         checks.grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
-        ttk.Checkbutton(checks, text="允许客户端通过本机上网（写 iptables NAT 规则）",
-                        variable=self.nat, command=self._refresh_steps).pack(anchor="w")
+        ttk.Checkbutton(checks, text=nat_text,
+                        variable=self.nat, command=self._refresh_steps,
+                        state="normal" if plan.nat_method else "disabled").pack(anchor="w")
         ttk.Checkbutton(checks, text="开启 IP 转发（net.ipv4.ip_forward=1，持久化）",
                         variable=self.forward, command=self._refresh_steps).pack(
             anchor="w", pady=(2, 0))
@@ -1331,11 +1337,15 @@ class InstallDialog:
         lines.append(f"{index}. 写入 {self.plan.conf_path}：网段 {net}，UDP {port}，权限 600")
         index += 1
         if self.nat.get():
-            lines.append(
-                f"{index}. 写 NAT 规则：客户端流量经 {self.plan.default_iface} 转发出去"
-                if self.plan.default_iface
-                else f"{index}. 未识别出口网卡，跳过 NAT（客户端只能访问本机）"
-            )
+            if self.plan.nat_method == "iptables" and self.plan.default_iface:
+                lines.append(
+                    f"{index}. 写 NAT 规则（iptables）：客户端流量经 "
+                    f"{self.plan.default_iface} 转发出去"
+                )
+            elif self.plan.nat_method == "firewalld":
+                lines.append(f"{index}. 在 firewalld 开启 masquerade（实现 NAT）")
+            else:
+                lines.append(f"{index}. 未检测到 iptables，跳过 NAT（客户端只能访问本机）")
             index += 1
         if self.forward.get() and not self.plan.forward_enabled:
             lines.append(f"{index}. 开启 IP 转发并持久化到 /etc/sysctl.d/99-wireguard.conf")
