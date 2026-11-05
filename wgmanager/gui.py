@@ -16,12 +16,27 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+from . import __version__
 from .backend import make_backend
 from .downloads import CLIENTS, OFFICIAL_INSTALL_PAGE, open_url
 from .installer import Options as InstallOptions
 from .installer import build_plan, run_install
 from .probe import ProbeError, ServerMissing, probe
 from .service import WGService
+from .updater import (
+    RELEASES_PAGE,
+    Latest,
+    UpdateError,
+    apply_update,
+    cleanup_stale,
+    download,
+    exe_path,
+    fetch_latest,
+    fetch_sha,
+    is_newer,
+    pending_update,
+    update_dir,
+)
 from .util import (
     normalize_allowed_ips,
     patch_client_conf,
@@ -135,7 +150,7 @@ class App:
         _enable_dpi()
         self.root = tk.Tk()
         self.root.withdraw()
-        self.root.title("WireGuard 密钥管理工具  v1.0")
+        self.root.title(f"WireGuard 密钥管理工具  v{__version__}")
         self.root.geometry("1120x760")
         self.root.minsize(980, 660)
         _setup_fonts(self.root)
@@ -168,6 +183,25 @@ class App:
         width = min(max(1120, self.root.winfo_reqwidth() + 12), int(sw * 0.94))
         height = min(max(720, self.root.winfo_reqheight() + 12), int(sh * 0.90))
         center_window(self.root, width, height)
+        self._check_pending_update()
+
+    def _check_pending_update(self) -> None:
+        """上次替换失败会留下 update-error.txt，启动时提醒一句，别让人以为更新成功了。"""
+        try:
+            work_dir = update_dir(app_dir())
+        except Exception:
+            return
+        err = pending_update(work_dir)
+        if not err:
+            return
+        self._append_log(
+            "上次自动更新没有成功，当前运行的仍是旧版本。可以重新点「检查更新」再试一次。"
+        )
+        self.update_hint.configure(text="上次更新未完成", foreground="#b03030")
+        try:
+            os.remove(err)
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------ 布局
     def _build(self) -> None:
@@ -183,6 +217,21 @@ class App:
 
         self._build_peers(ttk.LabelFrame(root, text=" ③ 密钥列表 ", padding=10))
         self._build_log(ttk.LabelFrame(root, text=" 操作日志 ", padding=6))
+        self._build_footer()
+
+    def _build_footer(self) -> None:
+        """底部状态条：版本号 + 检查更新。不占按钮行，避免把连接区挤宽。"""
+        bar = ttk.Frame(self.root)
+        bar.pack(fill="x", padx=14, pady=(0, 8))
+        ttk.Label(bar, text=f"v{__version__}", foreground="#8a8a8a").pack(side="left")
+        ttk.Label(bar, text="·", foreground="#c8c8c8").pack(side="left", padx=6)
+        self.update_btn = ttk.Button(bar, text="检查更新", width=11,
+                                     command=self.check_update)
+        self.update_btn.pack(side="left")
+        self.update_hint = ttk.Label(bar, text="", foreground="#8a8a8a")
+        self.update_hint.pack(side="left", padx=10)
+        ttk.Button(bar, text="发行版页面", width=12,
+                   command=lambda: open_url(RELEASES_PAGE)).pack(side="right")
 
     def _build_connection(self, frame) -> None:
         frame.pack(fill="x", padx=12, pady=(10, 8))
@@ -369,6 +418,18 @@ class App:
                     self.status_var.set(f"● {label}失败")
                     self._append_log(tb.strip())
                     messagebox.showerror(label + "失败", str(exc), parent=self.root)
+                elif kind == "update_ok":
+                    self._on_update_info(payload)
+                elif kind == "update_fail":
+                    self._on_update_fail(payload)
+                elif kind == "update_progress":
+                    self.update_btn.configure(text=f"下载 {payload}%")
+                elif kind == "update_downloaded":
+                    latest, new_exe = payload
+                    self._on_downloaded(latest, new_exe)
+                elif kind == "update_download_fail":
+                    latest, exc = payload
+                    self._on_download_failed(latest, exc)
         except queue.Empty:
             pass
         self.root.after(120, self._poll)
@@ -389,6 +450,154 @@ class App:
                 self.queue.put(("done", (result, done)))
 
         threading.Thread(target=runner, daemon=True).start()
+
+    # ------------------------------------------------------------ 检查更新
+    def check_update(self) -> None:
+        """只查版本，不下东西。结果通过队列回主线程。"""
+        self.update_btn.configure(state="disabled", text="检查中…")
+        self.update_hint.configure(text="", foreground="#8a8a8a")
+
+        def runner():
+            try:
+                latest = fetch_latest()
+            except UpdateError as exc:
+                self.queue.put(("update_fail", str(exc)))
+            except Exception as exc:
+                self.queue.put(("update_fail", f"{type(exc).__name__}: {exc}"))
+            else:
+                self.queue.put(("update_ok", latest))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _on_update_fail(self, message: str) -> None:
+        self.update_btn.configure(state="normal", text="检查更新")
+        self.update_hint.configure(text="检查失败", foreground="#b03030")
+        self._append_log("检查更新失败：" + message)
+        messagebox.showwarning(
+            "检查更新失败",
+            message + "\n\n可以手动打开发行版页面下载：\n" + RELEASES_PAGE,
+            parent=self.root,
+        )
+
+    def _on_update_info(self, latest: Latest) -> None:
+        self.update_btn.configure(state="normal", text="检查更新")
+        if not is_newer(latest.version, __version__):
+            self.update_hint.configure(text="已是最新版本", foreground="#0a7a3d")
+            messagebox.showinfo(
+                "检查更新",
+                f"当前已是最新版本 v{__version__}。",
+                parent=self.root,
+            )
+            return
+
+        self.update_hint.configure(
+            text=f"发现新版本 v{latest.version}", foreground="#a05000")
+        size_mb = latest.size / 1024 / 1024 if latest.size else 0
+        detail = f"当前版本：v{__version__}\n最新版本：v{latest.version}"
+        if size_mb:
+            detail += f"\n安装包大小：{size_mb:.1f} MB"
+        if latest.notes:
+            notes = latest.notes.strip().splitlines()
+            detail += "\n\n更新说明：\n" + "\n".join(notes[:8])
+
+        if not exe_path():
+            # 源码运行没有可替换的 exe，只能提示去下载
+            self._append_log("检测到新版本，但当前是源码运行，无法自动替换")
+            if messagebox.askyesno(
+                "发现新版本",
+                detail + "\n\n当前是源码方式运行，不能自动替换。\n"
+                "要打开发行版页面手动下载吗？",
+                parent=self.root,
+            ):
+                open_url(latest.page_url)
+            return
+
+        if not messagebox.askyesno(
+            "发现新版本",
+            detail + "\n\n现在下载并安装吗？装完会自动重启。",
+            parent=self.root,
+        ):
+            return
+        self._download_update(latest)
+
+    def _download_update(self, latest: Latest) -> None:
+        work_dir = update_dir(app_dir())
+        cleanup_stale(work_dir)
+        dest = os.path.join(work_dir, f"WireGuardManager-{latest.version}.exe")
+
+        def progress(pct, done, total):
+            # 频繁刷界面没意义，按 5% 步长报一次就够
+            if pct >= getattr(self, "_last_pct", -5) + 5 or pct >= 100:
+                self._last_pct = pct
+                self.queue.put(("update_progress", pct))
+
+        def work():
+            expected = fetch_sha(latest)
+            if not expected:
+                # 没有 SHA256.txt 也照下，但要在日志里留个记号
+                self.queue.put(("log", "警告：这个发行版没有 SHA256.txt，跳过完整性校验"))
+            digest = download(latest.exe_url, dest, expected, progress)
+            return dest, digest
+
+        self._last_pct = -5
+        self.update_btn.configure(state="disabled", text="下载 0%")
+        self._append_log(f"开始下载 v{latest.version}…")
+
+        def runner():
+            try:
+                result = work()
+            except Exception as exc:
+                self.queue.put(("update_download_fail", (latest, exc)))
+            else:
+                self.queue.put(("update_downloaded", (latest, result[0])))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _on_downloaded(self, latest: Latest, new_exe: str) -> None:
+        self.update_btn.configure(state="normal", text="检查更新")
+        self.update_hint.configure(text=f"v{latest.version} 已就绪", foreground="#0a7a3d")
+        self._append_log(f"v{latest.version} 下载完成并校验通过：{new_exe}")
+
+        if not messagebox.askyesno(
+            "准备安装",
+            f"新版 v{latest.version} 已下载并校验通过。\n\n"
+            "点「确定」后程序会关闭，自动替换文件并重新启动。\n"
+            "替换期间请不要强杀进程或断电。",
+            parent=self.root,
+        ):
+            self._append_log("已取消安装，下载的文件保留在 updates\\ 里，可以稍后再装")
+            return
+
+        try:
+            apply_update(new_exe, exe_path(), os.path.dirname(new_exe))
+        except Exception as exc:
+            messagebox.showerror(
+                "无法启动更新程序",
+                f"{exc}\n\n可以手动把\n{new_exe}\n复制覆盖到\n{exe_path()}",
+                parent=self.root,
+            )
+            return
+
+        self._append_log("正在关闭并重启以完成更新…")
+        self.root.after(400, self._quit_for_update)
+
+    def _on_download_failed(self, latest: Latest, exc: Exception) -> None:
+        self.update_btn.configure(state="normal", text="检查更新")
+        self.update_hint.configure(text="下载失败", foreground="#b03030")
+        self._append_log(f"下载 v{latest.version} 失败：{exc}")
+        messagebox.showwarning(
+            "下载失败",
+            f"{exc}\n\n可以手动打开发行版页面下载：\n{latest.page_url}",
+            parent=self.root,
+        )
+
+    def _quit_for_update(self) -> None:
+        try:
+            if self.backend:
+                self.backend.close()
+        except Exception:
+            pass
+        self.root.destroy()
 
     def _set_buttons(self) -> None:
         connected = self.service is not None

@@ -35,6 +35,9 @@ __pycache__/
 # PyInstaller 首次命令行打包自动生成的冗余 spec（权威配置是 wireguard-manager.spec）
 WireGuard密钥管理工具.spec
 
+# 打包时由 build_assets/stamp_version.py 生成，内容随每次构建变化
+version.txt
+
 # 验证用的原始截图（4MB BMP，仓库里只留压缩后的 PNG）
 build_assets/*.bmp
 

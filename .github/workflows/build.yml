@@ -42,6 +42,21 @@ jobs:
       - name: Verify tkinter is available
         run: python -c "import tkinter; print('tkinter', tkinter.TkVersion)"
 
+      # 版本号必须注入到源码里，否则 exe 里的 __version__ 永远是 1.0.0，
+      # 「检查更新」会把线上每一次构建都当成新版本，天天提示升级。
+      - name: Stamp version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $ver = $env:GITHUB_REF_NAME.TrimStart("v")
+          } else {
+            $ver = "1.0.${{ github.run_number }}"
+          }
+          Write-Host "Stamped version: $ver"
+          python build_assets/stamp_version.py $ver
+          Get-Content version.txt
+          Select-String -Path wgmanager/__init__.py -Pattern "__version__"
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
@@ -61,7 +76,10 @@ jobs:
           Copy-Item $exe.FullName "release/$env:EXE_NAME" -Force
           $hash = (Get-FileHash "release/$env:EXE_NAME" -Algorithm SHA256).Hash
           "$hash  $env:EXE_NAME" | Out-File -FilePath "release/SHA256.txt" -Encoding ascii
+          # 客户端的「检查更新」直接读这个文件判断版本，比从标题里抠字符串可靠
+          Copy-Item "version.txt" "release/version.txt" -Force
           Write-Host "SHA256: $hash"
+          Write-Host "Version asset: $(Get-Content release/version.txt)"
 
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
@@ -102,6 +120,7 @@ jobs:
           files: |
             release/WireGuardManager.exe
             release/SHA256.txt
+            release/version.txt
 
       # ---- 打 tag（v1.0.0 这种）：发布正式版本 ----
       - name: Publish versioned release
@@ -121,3 +140,4 @@ jobs:
           files: |
             release/WireGuardManager.exe
             release/SHA256.txt
+            release/version.txt

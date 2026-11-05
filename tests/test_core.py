@@ -912,6 +912,101 @@ class TestClientDownloads(unittest.TestCase):
         self.assertNotEqual(by_platform["macOS"], by_platform["iOS / iPadOS"])
 
 
+class TestUpdater(unittest.TestCase):
+    """更新功能的三条底线：版本别比错、只认官方域名、SHA 对不上不装。"""
+
+    def test_version_parsing_and_comparison(self):
+        from wgmanager.updater import is_newer, normalize_version, parse_version
+
+        self.assertEqual(parse_version("最新构建 v1.0.10"), (1, 0, 10))
+        self.assertEqual(parse_version("v2.1"), (2, 1))
+        self.assertEqual(parse_version(""), ())
+
+        # release 标题是人写的，显示前必须洗成纯版本号
+        self.assertEqual(normalize_version("最新构建 v1.0.10"), "1.0.10")
+        self.assertEqual(normalize_version("v1.2.3\n"), "1.2.3")
+        self.assertEqual(normalize_version("latest"), "")
+
+        # 直接比字符串会把 1.0.10 判成小于 1.0.9，必须按数字段比
+        self.assertTrue(is_newer("1.0.10", "1.0.9"))
+        self.assertTrue(is_newer("1.0.10", "1.0.2"))
+        self.assertFalse(is_newer("1.0.2", "1.0.10"))
+        self.assertFalse(is_newer("1.0.10", "1.0.10"))
+        self.assertTrue(is_newer("1.1", "1.0.99"))
+
+    def test_rejects_non_official_host(self):
+        from wgmanager.updater import UpdateError, _check_host
+
+        _check_host("https://github.com/leirui2/wireguard-manage/releases/x")
+        _check_host("https://objects.githubusercontent.com/abc")
+        for bad in (
+            "https://example.com/x.exe",
+            "http://github.com.evil.io/x.exe",
+            "https://raw.githubusercontent.com.evil.io/x",
+        ):
+            with self.subTest(url=bad):
+                with self.assertRaises(UpdateError):
+                    _check_host(bad)
+
+    def test_download_verifies_sha256(self):
+        import hashlib
+        import io as _io
+        import tempfile
+        from unittest import mock
+
+        from wgmanager.updater import UpdateError, download
+
+        payload = b"fake-exe-bytes"
+        good = hashlib.sha256(payload).hexdigest().upper()
+        url = "https://github.com/x/y/releases/download/latest/a.exe"
+
+        class FakeResponse(_io.BytesIO):
+            headers = {"Content-Length": str(len(payload))}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "new.exe")
+            with mock.patch("wgmanager.updater.urllib.request.urlopen",
+                            return_value=FakeResponse(payload)):
+                digest = download(url, dest, good)
+            self.assertEqual(digest, good)
+            self.assertTrue(os.path.isfile(dest))
+
+            # SHA 对不上必须把文件删掉，不能把来路不明的 exe 留在磁盘上
+            with mock.patch("wgmanager.updater.urllib.request.urlopen",
+                            return_value=FakeResponse(payload)):
+                with self.assertRaises(UpdateError):
+                    download(url, dest, "0" * 64)
+            self.assertFalse(os.path.exists(dest))
+            self.assertFalse(os.path.exists(dest + ".part"))
+
+    def test_wrapper_script_uses_copy_and_restarts(self):
+        from wgmanager.updater import _WRAPPER
+
+        self.assertIn("copy /y", _WRAPPER)
+        self.assertIn("goto wait", _WRAPPER)
+        self.assertIn('start "" "%OLD%"', _WRAPPER)
+        # 只替换目标文件，绝不能出现批量删除
+        self.assertNotIn("/s /q", _WRAPPER.lower())
+
+    def test_pending_update_detection(self):
+        import tempfile
+
+        from wgmanager.updater import pending_update
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(pending_update(tmp), "")
+            bad = os.path.join(tmp, "update-error.txt")
+            with open(bad, "w", encoding="utf-8") as fh:
+                fh.write("copy failed")
+            self.assertEqual(pending_update(tmp), bad)
+
+
 class TestQrDialog(unittest.TestCase):
     def test_image_survives_garbage_collection(self):
         """真实路径下没人持有 QrDialog 实例，图片引用必须挂在窗口上，否则界面留白。"""

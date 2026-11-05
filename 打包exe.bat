@@ -16,6 +16,21 @@ if not exist "%PY%" (
 )
 
 echo Building, please wait...
+
+if not "%~1"=="" (
+  echo Stamping version %~1 ...
+  "%PY%" "%ROOT%build_assets\stamp_version.py" "%~1"
+  if errorlevel 1 (
+    echo.
+    echo [ERROR] Bad version. Use something like 1.0.12
+    pause
+    exit /b 1
+  )
+) else (
+  echo [INFO] No version given, using the one in wgmanager\__init__.py
+  echo        Use "打包exe.bat 1.0.12" to stamp a version before building.
+)
+
 "%PY%" -m PyInstaller --noconfirm --clean "%ROOT%wireguard-manager.spec"
 if errorlevel 1 (
   echo.
