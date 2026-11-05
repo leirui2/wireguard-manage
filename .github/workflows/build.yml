@@ -1,0 +1,60 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Test (windows-x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: "x64"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Verify tkinter is available
+        run: python -c "import tkinter; print('tkinter', tkinter.TkVersion)"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build single-file exe
+        run: python -m PyInstaller --noconfirm --clean wireguard-manager.spec
+
+      - name: Sanity check output
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path dist -Filter *.exe | Select-Object -First 1
+          if ($null -eq $exe) { throw "No exe was produced in dist/" }
+          Write-Host ("Built: {0} ({1:N1} MB)" -f $exe.Name, ($exe.Length / 1MB))
+          if ($exe.Length -lt 5MB) { throw "exe looks too small, build likely incomplete" }
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WireGuardManager-windows-x64
+          path: dist/*.exe
+          retention-days: 30
+          if-no-files-found: error
