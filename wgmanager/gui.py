@@ -22,6 +22,8 @@ from .downloads import CLIENTS, OFFICIAL_INSTALL_PAGE, open_url
 from .installer import Options as InstallOptions
 from .installer import build_plan, run_install
 from .probe import ProbeError, ServerMissing, probe
+from .secrets import available as sealed_available
+from .secrets import is_sealed, protect, unprotect
 from .service import WGService
 from .updater import (
     RELEASES_PAGE,
@@ -145,6 +147,23 @@ def _save_profiles(profiles: list[dict]) -> None:
         pass
 
 
+def _profile_key(profile: dict) -> tuple[str, int, str]:
+    """一条配置的唯一标识：同一个 IP 换端口或换用户都是另一条，不能互相覆盖。
+
+    以前只按 host 去重，于是 ``1.2.3.4:22 root`` 和 ``1.2.3.4:10022 jsd``
+    会挤成一条，后存的把先存的连同口令一起顶掉。
+    """
+    try:
+        port = int(profile.get("port") or 22)
+    except (TypeError, ValueError):
+        port = 22
+    return (
+        str(profile.get("host", "")).strip(),
+        port,
+        str(profile.get("username", "")).strip(),
+    )
+
+
 class App:
     def __init__(self):
         _enable_dpi()
@@ -248,6 +267,8 @@ class App:
         self.demo_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="● 未连接")
         self.profile_var = tk.StringVar()
+        # 默认记住：省得每次选完配置还要再敲一遍密码
+        self.remember_var = tk.BooleanVar(value=True)
 
         row = ttk.Frame(frame)
         row.pack(fill="x", pady=2)
@@ -318,6 +339,14 @@ class App:
         self.status_label = ttk.Label(row3, textvariable=self.status_var,
                                       foreground="#b03030")
         self.status_label.pack(side="right")
+        self.remember_check = ttk.Checkbutton(
+            row3, text="记住密码", variable=self.remember_var,
+        )
+        self.remember_check.pack(side="right", padx=(0, 14))
+        if not sealed_available():
+            # 拿不到 DPAPI 就干脆不提供这个选项，免得以为记住了其实没有
+            self.remember_var.set(False)
+            self.remember_check.configure(state="disabled")
         self._on_auth_change()
 
         self.adv_conf = tk.StringVar()
@@ -1029,21 +1058,37 @@ class App:
     def _save_current_profile(self, conn: dict) -> None:
         if conn.get("demo"):
             return
+        remember = bool(self.remember_var.get())
         profile = {
             "host": conn["host"], "port": conn["port"],
             "username": conn["username"], "auth": conn["auth"],
             "key_path": conn.get("key_path", ""),
         }
-        profiles = _load_profiles()
-        profiles = [p for p in profiles if p.get("host") != profile["host"]]
+        if remember:
+            # 只存加密后的口令，密码本身绝不明文落盘。protect() 失败会返回空串，
+            # 那就等于没存 —— 降级成"每次重输"，绝不退回明文。
+            for field in ("password", "key_passphrase", "sudo_password"):
+                sealed = protect(conn.get(field, ""))
+                if sealed:
+                    profile[field] = sealed
+        key = _profile_key(profile)
+        profiles = [p for p in _load_profiles() if _profile_key(p) != key]
         profiles.insert(0, profile)
         _save_profiles(profiles)
         self._refresh_profile_combo()
+        if remember and not getattr(self, "_sealed_hint_done", False):
+            self._sealed_hint_done = True
+            self._log("口令已加密保存在 connections.json（Windows DPAPI，"
+                      "换机器或换 Windows 账号后需要重新输入）。")
 
     def _refresh_profile_combo(self) -> None:
         profiles = _load_profiles()
-        self.profile_combo["values"] = [f"{p['host']} ({p.get('username', '')})" for p in profiles]
         self._profiles = profiles
+        # 带上端口：同一个 IP 用不同端口/账号是两条配置，只显示 IP 会分不清
+        self.profile_combo["values"] = [
+            f"{p.get('host', '')}:{p.get('port', 22)} ({p.get('username', '')})"
+            for p in profiles
+        ]
 
     def _on_profile_selected(self, _event=None) -> None:
         idx = self.profile_combo.current()
@@ -1055,6 +1100,14 @@ class App:
         self.user_var.set(p.get("username", "root"))
         self.auth_var.set(p.get("auth", "password"))
         self.key_var.set(p.get("key_path", ""))
+        # 解不开就是空串（换机器/换账号/文件被改），让用户重输即可，
+        # 不弹错误框打断 —— 这只是"没记住"，不是故障。
+        self.password_var.set(unprotect(p.get("password", "")))
+        self.key_pass_var.set(unprotect(p.get("key_passphrase", "")))
+        self.sudo_pwd_var.set(unprotect(p.get("sudo_password", "")))
+        self.remember_var.set(
+            any(is_sealed(p.get(k)) for k in ("password", "key_passphrase", "sudo_password"))
+        )
         self._on_auth_change()
 
     def _on_close(self) -> None:
