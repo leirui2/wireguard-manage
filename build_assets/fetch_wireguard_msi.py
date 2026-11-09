@@ -21,6 +21,13 @@ import tempfile
 import urllib.error
 import urllib.request
 
+# GitHub Actions 的 Windows runner 控制台默认 cp1252，本文件里的中文 print
+# 会直接抛 UnicodeEncodeError。这一步是 continue-on-error 的软步骤，崩了会被
+# 静默跳过 → 安装包莫名少了「同时装客户端」选项，很难看出原因。
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build_assets")
 BASE = "https://download.wireguard.com/windows-client/wireguard-amd64-{}.msi"

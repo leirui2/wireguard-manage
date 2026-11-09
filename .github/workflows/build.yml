@@ -18,6 +18,11 @@ env:
   EXE_NAME: WireGuardManager.exe
   # 发行版资产名一律 ASCII：中文在下载链接里要转义，复制传播容易乱码
   SETUP_NAME: WireGuardManager-setup.exe
+  # runner 的控制台编码是 cp1252，Python 默认按它写 stdout，脚本里任何一句
+  # 中文 print 都会抛 UnicodeEncodeError 直接把构建打挂（2026-11-09 真挂过一次）。
+  # 构建脚本自己 reconfigure 过 stdout，这里再加一层进程级兜底。
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
 
 jobs:
   build:

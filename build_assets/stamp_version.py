@@ -21,6 +21,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# GitHub Actions 的 Windows runner 控制台默认 cp1252，中文输出会抛
+# UnicodeEncodeError（SystemExit 里的中文报错同样会炸），统一转 UTF-8。
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 VERSION_RE = re.compile(r"\d+(\.\d+){0,3}")
 
 

@@ -25,6 +25,12 @@ import shutil
 import subprocess
 import sys
 
+# GitHub Actions 的 Windows runner 控制台默认 cp1252，本文件里的中文 print
+# 会直接抛 UnicodeEncodeError 把构建打挂 —— 不是编译失败，是打印机失败。
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build_assets")
 DIST = os.path.join(ROOT, "dist")

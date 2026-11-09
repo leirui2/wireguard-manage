@@ -26,6 +26,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "build_assets"))
 
+# GitHub Actions 的 Windows runner 控制台默认 cp1252，中文输出会抛
+# UnicodeEncodeError，统一转 UTF-8（CI 里实际走的是 stamp_version，这里对齐）。
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 from stamp_version import stamp  # noqa: E402  （同目录，避免依赖 build_assets 是包）
 
 INIT = ROOT / "wgmanager" / "__init__.py"

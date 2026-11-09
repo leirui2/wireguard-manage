@@ -12,6 +12,12 @@ import os
 import re
 import sys
 
+# GitHub Actions 的 Windows runner 控制台默认 cp1252，本文件里的中文 print
+# 会直接抛 UnicodeEncodeError 把构建打挂（曾经真的挂过一次）。
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 W, H = 460, 250
 BG = "#ffffff"
 TITLE = "#1a1a1a"
