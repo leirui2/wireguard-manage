@@ -43,6 +43,16 @@ build_assets/wireguard-amd64-*.msi
 # 打包时由 build_assets/stamp_version.py 生成，内容随每次构建变化
 version.txt
 
+# 启动图里印着版本号，由 build_assets/make_splash.py 现生成（必须在 stamp 之后）。
+# 跟进仓库只会让下一次构建拿到上一个版本的图，CI 和本地都必须自己跑一遍。
+build_assets/splash.png
+
+# 实验用的临时 spec / 中间产物，权威配置是 wireguard-manager.spec
+# 和 wireguard-manager-onedir.spec
+tmp-*.spec
+.tmp-build/
+.tmp-dist/
+
 # 验证用的原始截图（4MB BMP，仓库里只留压缩后的 PNG）
 build_assets/*.bmp
 
