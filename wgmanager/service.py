@@ -277,7 +277,7 @@ class WGService:
             preshared_key=psk,
             allowed_ips=client_allowed_ips,
             endpoint=(endpoint or "").strip() or default_endpoint,
-            comment=f"由 WireGuard 密钥管理工具生成 | {name} | {created}",
+            comment=f"由 WireGuard 管理台生成 | {name} | {created}",
         )
 
         applied = self._apply(conf.render(), expect_present={pub}, expect_absent=set(),

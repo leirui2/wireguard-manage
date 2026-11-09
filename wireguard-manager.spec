@@ -52,7 +52,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="WireGuard密钥管理工具",
+    name="WireGuard管理台",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

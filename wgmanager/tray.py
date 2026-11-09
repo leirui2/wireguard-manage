@@ -64,7 +64,7 @@ class Tray:
     """托盘本体。所有回调都会被编组到 Tk 主线程。"""
 
     def __init__(self, tk_root, *, on_show, on_quit, on_check_update=None,
-                 title: str = "WireGuard 密钥管理"):
+                 title: str = "WireGuard 管理台"):
         import pystray
 
         self.root = tk_root

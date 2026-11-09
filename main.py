@@ -1,7 +1,7 @@
-"""WireGuard 密钥管理工具 —— 入口。
+"""WireGuard 管理台 —— 入口。
 
 开发时：双击 启动工具.bat，或执行 `python main.py`
-打包后：直接双击 dist\\WireGuard密钥管理工具.exe
+打包后：直接双击 dist\\WireGuard管理台.exe
 """
 from __future__ import annotations
 

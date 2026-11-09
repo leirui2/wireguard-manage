@@ -482,7 +482,7 @@ def render_conf(
     没 iptables 的机器（RHEL 9 精简安装、树莓派 Lite 等）宁可不写，也不能写错。
     """
     lines = [
-        "# 由 WireGuard 密钥管理工具自动创建",
+        "# 由 WireGuard 管理台自动创建",
         f"# 创建时间：{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')}",
         "[Interface]",
         f"Address = {plan.server_address}",

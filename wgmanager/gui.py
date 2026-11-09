@@ -21,6 +21,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from . import __version__
 from . import autostart as autostart_mod
 from . import tray as tray_mod
+from . import tunnel as tunnel_mod
 from .audit import ACTION_LABELS, AuditLog, export_csv
 from .backend import make_backend
 from .downloads import CLIENTS, OFFICIAL_INSTALL_PAGE, open_url
@@ -33,6 +34,7 @@ from .secrets import is_sealed, protect, unprotect
 from .service import WGService
 from .settings import Settings
 from .traffic import TrafficStore, human_rate, nice_rate_ceiling
+from .tunnel import TunnelStore
 from .updater import (
     RELEASES_PAGE,
     Latest,
@@ -49,6 +51,7 @@ from .updater import (
     update_dir,
 )
 from .util import (
+    human_bytes,
     normalize_allowed_ips,
     parse_expire_date,
     patch_client_conf,
@@ -60,6 +63,18 @@ from .vault import Vault
 
 # 动作下拉里显示中文，查询时再换回内部 key
 _ACTION_BY_LABEL = {v: k for k, v in ACTION_LABELS.items()}
+
+#: 组网下拉里"不组网"的那一项。隧道名一律被 normalize_name 洗成 ASCII，
+#: 不可能和这个中文串撞上。
+DIRECT_TUNNEL = "直连（不组网）"
+
+# 管理页那行组网提示。光甩一个状态词没人看得懂，直接说连接时会发生什么。
+_TUNNEL_HINT = {
+    "absent": "连接时自动建立（现在还没有）",
+    "running": "隧道正在运行，连接时直接复用",
+    "stopped": "隧道已停止，连接时会重新拉起",
+    "pending": "隧道正在启动，连接时直接复用",
+}
 
 
 def app_dir() -> str:
@@ -90,14 +105,79 @@ def _enable_dpi() -> None:
         pass
 
 
-def _setup_fonts(root: tk.Tk) -> None:
-    import tkinter.font as tkfont
+class UiFonts:
+    """界面字号的唯一来源。
 
-    for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
-        try:
-            tkfont.nametofont(name).configure(family=CN_FONT, size=10)
-        except Exception:
-            pass
+    Tk 里字号有两种给法，都要管住才能真正"一处改、全界面变"：
+
+    * 控件不写字号时用**命名字体**（`TkDefaultFont` 等），ttk 的标签、按钮、
+      输入框、表格全走这条，改命名字体即可。
+    * 写死的 `(字体, 字号)` 元组改不动，所以这里把它们收成 `Font` **对象**：
+      对象是活的，`configure(size=...)` 之后所有引用它的控件立刻重绘。
+
+    `delta` 是相对基准字号的增量（0 = 正文，+2 = 小标题，-2 = 图注）。
+    """
+
+    #: 需要跟着基准字号一起变的命名字体。TkFixedFont 是等宽默认字体，
+    #: 我们自己用 Consolas 明写，不动它免得影响 Tk 内部控件。
+    NAMED = ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont",
+             "TkTooltipFont")
+
+    def __init__(self, root, base: int = 10):
+        self.root = root
+        self.base = max(7, min(20, int(base)))
+        self._cache: dict[tuple, object] = {}
+        self.apply_named()
+
+    # ------------------------------------------------------------ 取字体
+    def size(self, delta: int = 0) -> int:
+        return max(7, self.base + int(delta))
+
+    def get(self, family: str, delta: int = 0, weight: str = "normal"):
+        import tkinter.font as tkfont
+
+        key = (family, int(delta), weight)
+        font = self._cache.get(key)
+        if font is None:
+            font = tkfont.Font(root=self.root, family=family,
+                               size=self.size(delta), weight=weight)
+            self._cache[key] = font
+        return font
+
+    # ------------------------------------------------------------ 改字号
+    def set_base(self, base: int) -> None:
+        self.base = max(7, min(20, int(base)))
+        for (family, delta, weight), font in self._cache.items():
+            font.configure(size=self.size(delta))
+        self.apply_named()
+
+    def apply_named(self) -> None:
+        import tkinter.font as tkfont
+
+        for name in self.NAMED:
+            try:
+                tkfont.nametofont(name).configure(family=CN_FONT,
+                                                  size=self.size(0))
+            except Exception:
+                pass
+
+
+#: 当前生效的字体表。对话框里没有 app 引用，靠这两个模块级函数取字体。
+_UI_FONTS: "UiFonts | None" = None
+
+
+def ui_font(delta: int = 0, weight: str = "normal"):
+    """界面字体（中文）。delta 相对基准字号，0 = 正文。"""
+    if _UI_FONTS is not None:
+        return _UI_FONTS.get(CN_FONT, delta, weight)
+    return (CN_FONT, 10 + delta, weight)
+
+
+def mono_font(delta: int = 0):
+    """等宽字体：日志、公钥、配置预览。"""
+    if _UI_FONTS is not None:
+        return _UI_FONTS.get("Consolas", delta, "normal")
+    return ("Consolas", 10 + delta)
 
 
 def center_window(win, width: int | None = None, height: int | None = None,
@@ -192,23 +272,105 @@ def _server_label(conn: dict) -> str:
             f"({conn.get('username', '')})")
 
 
+def _tunnel_of(profile: dict) -> dict:
+    """配置档里那一段组网信息，没有就是空 dict。"""
+    data = (profile or {}).get("tunnel")
+    return data if isinstance(data, dict) else {}
+
+
 class App:
     def __init__(self):
         _enable_dpi()
         self.root = tk.Tk()
         self.root.withdraw()
-        self.root.title(f"WireGuard 密钥管理工具  v{__version__}")
+        self.root.title(f"WireGuard 管理台  v{__version__}")
         self.root.geometry("1270x760")
         self.root.minsize(1060, 680)
-        _setup_fonts(self.root)
 
+        # 字号要在建任何控件之前定下来，所以设置文件得先读 ——
+        # 后面的 self.settings 复用这一份，不要重复构造
+        self.settings = Settings(APP_DIR)
+        global _UI_FONTS
+        _UI_FONTS = self.fonts = UiFonts(
+            self.root, int(self.settings.get("ui_font_size", 10)))
+
+        self._setup_style()
+
+    # ------------------------------------------------------------ 外观
+    def _tree_rowheight(self) -> int:
+        """表格行高跟着字号走，否则字大了会被行高切掉下半截。"""
+        return int(round(27 * getattr(self.fonts, "base", 10) / 10))
+
+    def _refresh_tree_widths(self) -> None:
+        """表格列宽按字号同比放大。
+
+        列宽是死像素，字大了以后「388.8 KB/s」会被截成「388.8 KB/…」。
+        两棵表的基准宽度在构建时记下来了，这里按比例重设，反复改字号也不会累积误差。
+        """
+        ratio = getattr(self.fonts, "base", 10) / 10.0
+        for base_attr, tree_attr in (("_tun_col_base", "tun_tree"),
+                                     ("_peer_col_base", "tree")):
+            base = getattr(self, base_attr, None)
+            tree = getattr(self, tree_attr, None)
+            if not base or tree is None:
+                continue
+            for col, width in base.items():
+                try:
+                    tree.column(col, width=max(48, int(round(width * ratio))))
+                except tk.TclError:
+                    pass
+
+    def set_ui_font_size(self, size: int) -> str:
+        """改界面字号：即时生效并写进设置，下次启动沿用。"""
+        size = max(8, min(14, int(size)))
+        self.fonts.set_base(size)
+        self.settings.set("ui_font_size", size)
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=self._tree_rowheight())
+        style.configure("Treeview.Heading", font=ui_font(0, "bold"))
+        style.configure("Accent.TButton", font=ui_font(0, "bold"))
+        self._refresh_tree_widths()
+        self._fit_layout()
+        self._draw_tunnel_chart()
+        return f"界面字号已改为 {size}"
+
+    def _fit_layout(self) -> None:
+        """字号变了要重新定窗口高度。
+
+        窗口高度上限是屏幕的 90%（1080p 上就是 972 px），字号调大很容易顶破，
+        顶破的后果是底部状态条被切掉一半。所以先把日志行数往下压、压到装得下，
+        再按需要的高度重建窗口 —— 宁可少显示两行日志，也不能让按钮消失。
+        """
+        txt = getattr(self, "log_text", None)
+        if txt is None:
+            return
+        cap = int(self.root.winfo_screenheight() * 0.90)
+        base = int(getattr(self.fonts, "base", 10))
+        # 同样高度的框，字大了自然放不下原来那么多行
+        prefer = max(6, min(14, int(round(100 / base))))
+        for lines in range(prefer, 4, -1):
+            txt.configure(height=lines)
+            self.root.update_idletasks()
+            if self.root.winfo_reqheight() + 12 <= cap:
+                break
+        sw = self.root.winfo_screenwidth()
+        width = min(max(1270, self.root.winfo_reqwidth() + 12), int(sw * 0.94))
+        height = min(max(960, self.root.winfo_height(),
+                         self.root.winfo_reqheight() + 12), cap)
+        self.root.geometry(f"{width}x{height}")
+
+    def _setup_style(self) -> None:
         style = ttk.Style()
         if "vista" in style.theme_names():
             style.theme_use("vista")
-        style.configure("Treeview", rowheight=27)
-        style.configure("Treeview.Heading", font=(CN_FONT, 10, "bold"))
-        style.configure("Accent.TButton", font=(CN_FONT, 10, "bold"))
+        self.fonts.apply_named()
+        style.configure("Treeview", rowheight=self._tree_rowheight())
+        style.configure("Treeview.Heading", font=ui_font(0, "bold"))
+        style.configure("Accent.TButton", font=ui_font(0, "bold"))
 
+        self._init_state()
+
+    def _init_state(self) -> None:
         self.queue: queue.Queue = queue.Queue()
         self.busy = False
         self.backend = None
@@ -222,16 +384,27 @@ class App:
         # 不断开、不重连、不用重新输密码
         self.servers: dict[str, dict] = {}
         self.active: str = ""
+        # 本次运行里由我们亲手拉起来的组网隧道，退出时按设置决定要不要拆
+        self._tunnels_up: set[str] = set()
         # 客户端配置保险箱：key 是客户端公钥（改名不变），内容是加密后的 .conf
         self.vault = Vault(APP_DIR)
         # 本地配置历史：每次改动前存一份原样，可预览、可还原
         self.history = History(APP_DIR)
         # 操作审计：每次写操作记一行，只记公钥不记私钥
         self.audit = AuditLog(APP_DIR)
-        # 界面偏好（托盘 / 自启 / 刷新间隔），和连接凭据分开存
-        self.settings = Settings(APP_DIR)
+        # 界面偏好（托盘 / 自启 / 刷新间隔 / 字号）已经在 __init__ 里读过，
+        # 这里直接复用，别再构造一次 —— 会把手改的偏好覆盖回默认值
         # 流量采样：wg show transfer 是累计值，存下来才能算速率画趋势
         self.traffic = TrafficStore(APP_DIR)
+        # 本机组网的隧道配置仓库：和服务器配置分开存，删了服务器隧道还该留着
+        self.tunnels = TunnelStore(APP_DIR)
+        # 上一版把组网 conf 塞在服务器配置里，启动时挪进仓库
+        self._migrate_tunnel_profiles()
+        # 上次异常退出可能在 %TEMP% 留下明文 conf，启动时顺手扫一遍
+        try:
+            tunnel_mod.cleanup_stale()
+        except Exception:
+            pass
         self._last_sample = 0.0
         # 系统托盘：pystray 跑在子线程，菜单回调经 root.after 编组回主线程
         self.tray = None
@@ -249,21 +422,39 @@ class App:
         # 同时发 exec_command 有概率互相踩，用一把锁串起来
         self._ssh_lock = threading.Lock()
 
+        # 组网页的实时速率：只在本机读网卡计数，不联网、不动服务器
+        self._tun_job = None
+        self._tun_prev: dict[str, tuple[float, int, int]] = {}   # 名 -> (时刻, 收, 发)
+        self._tun_hist: dict[str, list[tuple[float, float]]] = {}  # 名 -> [(收B/s, 发B/s)]
+        self._tun_dump: dict[str, dict] = {}                     # 名 -> wg show dump
+        self._tun_dumping: set[str] = set()
+        self._tun_dump_at = 0.0
+        self._tun_conf_cache: dict[str, str] = {}
+        self._tun_sel = ""
+
         self._poll_job = None
+        self._tray_job = None
         self._build()
+        self._refresh_tree_widths()
         self._poll_job = self.root.after(120, self._poll)
+        self._tun_job = self.root.after(1000, self._tunnel_tick)
         self._monitor_job = self.root.after(3000, self._monitor_tick)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         if self.settings.get("tray_enabled", True) and tray_mod.available():
-            self.root.after(800, self._start_tray_if_enabled)
-        self._log("就绪。填好服务器信息后点「连接」；也可以直接勾选「演示模式」先试用。")
+            self._tray_job = self.root.after(800, self._start_tray_if_enabled)
+        self._log("就绪。「本机组网」页可以单独连隧道；「密钥管理」页填服务器信息后点「连接」。"
+                  "想先试用可以勾「演示模式」。")
         self._refresh_profile_combo()
         self._refresh_server_combo()
+        self._refresh_tunnel_combo()
+        self._refresh_tunnels()
         # 按内容实际需要的尺寸开窗，并限制在屏幕内，避免新增控件被裁切
         self.root.update_idletasks()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         width = min(max(1270, self.root.winfo_reqwidth() + 12), int(sw * 0.94))
-        height = min(max(720, self.root.winfo_reqheight() + 12), int(sh * 0.90))
+        # 表格只请求 6 行，光按 req 算窗口会偏矮；给个下限，
+        # 剩下的高度由表格自己撑开
+        height = min(max(960, self.root.winfo_reqheight() + 12), int(sh * 0.90))
         center_window(self.root, width, height)
         self._check_pending_update()
 
@@ -288,8 +479,22 @@ class App:
     # ------------------------------------------------------------------ 布局
     def _build(self) -> None:
         root = self.root
-        self._build_connection(ttk.LabelFrame(root, text=" ① 连接服务器 ", padding=10))
-        self.info_frame = ttk.LabelFrame(root, text=" ② 探测结果 ", padding=10)
+
+        # 两页彻底分开：组网是独立功能，不需要服务器、不需要 SSH；
+        # 管理页只在需要时引用一条隧道。
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True, pady=(6, 0))
+
+        self.net_page = ttk.Frame(self.notebook)
+        self.notebook.add(self.net_page, text="   本机组网   ")
+        self._build_tunnels_page(self.net_page)
+
+        self.mgmt_page = ttk.Frame(self.notebook)
+        self.notebook.add(self.mgmt_page, text="   密钥管理   ")
+
+        self._build_connection(
+            ttk.LabelFrame(self.mgmt_page, text=" ① 连接服务器 ", padding=10))
+        self.info_frame = ttk.LabelFrame(self.mgmt_page, text=" ② 探测结果 ", padding=8)
         self.info_frame.pack(fill="x", padx=12, pady=(0, 8))
         self.info_var = tk.StringVar(value="尚未连接")
         ttk.Label(self.info_frame, textvariable=self.info_var, wraplength=1040,
@@ -297,9 +502,19 @@ class App:
         ttk.Button(self.info_frame, text="探测详情", command=self._show_diagnostics,
                    width=12).pack(side="right", padx=(10, 0))
 
-        self._build_peers(ttk.LabelFrame(root, text=" ③ 密钥列表 ", padding=10))
-        self._build_log(ttk.LabelFrame(root, text=" 操作日志 ", padding=6))
+        self._build_peers(ttk.LabelFrame(self.mgmt_page, text=" ③ 密钥列表 ", padding=10))
+        self._build_log(ttk.LabelFrame(self.mgmt_page, text=" 操作日志 ", padding=6))
         self._build_footer()
+
+        # 切到组网页就刷一次状态：隧道可能在别处被连上或断开了
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _on_tab_changed(self, _event=None) -> None:
+        try:
+            if self.notebook.index("current") == 0 and not self.busy:
+                self._refresh_tunnels()
+        except Exception:
+            pass
 
     def _build_footer(self) -> None:
         """底部状态条：版本号 + 检查更新。不占按钮行，避免把连接区挤宽。"""
@@ -322,7 +537,7 @@ class App:
                    command=self.show_settings).pack(side="right", padx=(0, 6))
 
     def _build_connection(self, frame) -> None:
-        frame.pack(fill="x", padx=12, pady=(10, 8))
+        frame.pack(fill="x", padx=12, pady=(8, 4))
         self.conn_frame = frame
 
         self.host_var = tk.StringVar()
@@ -334,13 +549,15 @@ class App:
         self.key_pass_var = tk.StringVar()
         self.sudo_pwd_var = tk.StringVar()
         self.demo_var = tk.BooleanVar(value=False)
+        # 组网下拉的"不组网"哨兵值。隧道名一律被 normalize_name 洗成 ASCII，
+        # 不可能和这个中文串撞上。
         self.status_var = tk.StringVar(value="● 未连接")
         self.profile_var = tk.StringVar()
         # 默认记住：省得每次选完配置还要再敲一遍密码
         self.remember_var = tk.BooleanVar(value=True)
 
         row = ttk.Frame(frame)
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", pady=0)
         ttk.Label(row, text="服务器 IP：", width=11).pack(side="left")
         self.host_entry = ttk.Entry(row, textvariable=self.host_var, width=22)
         self.host_entry.pack(side="left")
@@ -359,7 +576,7 @@ class App:
                         command=self._on_demo_toggle).pack(side="right")
 
         row2 = ttk.Frame(frame)
-        row2.pack(fill="x", pady=(8, 2))
+        row2.pack(fill="x", pady=(6, 2))
         ttk.Label(row2, text="认证方式：", width=11).pack(side="left")
         self.rb_pwd = ttk.Radiobutton(row2, text="密码", value="password",
                                       variable=self.auth_var, command=self._on_auth_change)
@@ -380,7 +597,7 @@ class App:
         self.keypass_entry.pack(side="left")
 
         row2b = ttk.Frame(frame)
-        row2b.pack(fill="x", pady=(6, 0))
+        row2b.pack(fill="x", pady=(4, 0))
         ttk.Label(row2b, text="sudo 密码：", width=11).pack(side="left")
         self.sudo_pwd_entry = ttk.Entry(row2b, textvariable=self.sudo_pwd_var,
                                         width=20, show="●")
@@ -391,8 +608,24 @@ class App:
             foreground="#a05000",
         ).pack(side="left", padx=(10, 0))
 
+        # 组网：这里只"挑一条已经建好的隧道"，隧道本身在「本机组网」页管理。
+        # 有公网的服务器选"直连"就行，一点组网开销都不产生。
+        row2c = ttk.Frame(frame)
+        row2c.pack(fill="x", pady=(4, 0))
+        ttk.Label(row2c, text="组网隧道：", width=11).pack(side="left")
+        self.tunnel_var = tk.StringVar(value=DIRECT_TUNNEL)
+        self.tunnel_combo = ttk.Combobox(row2c, textvariable=self.tunnel_var,
+                                         state="readonly", width=24)
+        self.tunnel_combo.pack(side="left")
+        self.tunnel_combo.bind("<<ComboboxSelected>>",
+                               lambda _e: self._update_tunnel_hint())
+        ttk.Button(row2c, text="管理隧道…", width=11,
+                   command=self._goto_tunnels_page).pack(side="left", padx=(6, 0))
+        self.tunnel_hint = ttk.Label(row2c, text="", foreground="#8a8a8a")
+        self.tunnel_hint.pack(side="left", padx=(10, 0))
+
         row3 = ttk.Frame(frame)
-        row3.pack(fill="x", pady=(10, 0))
+        row3.pack(fill="x", pady=(8, 0))
         self.connect_btn = ttk.Button(row3, text="连接", width=12,
                                       style="Accent.TButton", command=self.connect)
         self.connect_btn.pack(side="left")
@@ -434,7 +667,7 @@ class App:
         self.server_combo.bind("<<ComboboxSelected>>", self._on_server_selected)
         self.count_var = tk.StringVar(value="共 0 个密钥")
         ttk.Label(bar, textvariable=self.count_var,
-                  font=(CN_FONT, 11, "bold")).pack(side="left", padx=(12, 0))
+                  font=ui_font(1, "bold")).pack(side="left", padx=(12, 0))
         self.refresh_btn = ttk.Button(bar, text="刷新", width=10, command=self.refresh,
                                       state="disabled")
         self.refresh_btn.pack(side="right", padx=4)
@@ -484,7 +717,11 @@ class App:
         body = ttk.Frame(frame)
         body.pack(fill="both", expand=True)
         self.tree_body = body
-        self.tree = ttk.Treeview(body, columns=columns, show="headings", selectmode="extended")
+        # height=6 是"请求高度"：真正显示多少行由 pack 的 expand 决定。
+        # 留成默认 10 行的话，字号调大时它会先占满，日志被挤到只剩几行。
+        self._peer_col_base = {k: v[1] for k, v in headers.items()}
+        self.tree = ttk.Treeview(body, columns=columns, show="headings",
+                                 height=6, selectmode="extended")
         for col in columns:
             title, width = headers[col]
             self.tree.heading(col, text=title)
@@ -506,8 +743,10 @@ class App:
 
     def _build_log(self, frame) -> None:
         frame.pack(fill="x", padx=12, pady=(0, 10))
-        self.log_text = scrolledtext.ScrolledText(frame, height=8, wrap="word",
-                                                  font=("Consolas", 9))
+        # 12 行 × 10 号：原来 8 行 9 号只能看到最近几次操作，出问题时
+        # 前因后果都在上面几行，得往上滚很不方便
+        self.log_text = scrolledtext.ScrolledText(frame, height=10, wrap="word",
+                                                  font=mono_font(0))
         self.log_text.pack(fill="x")
         self.log_text.configure(state="disabled")
 
@@ -569,6 +808,12 @@ class App:
                     key, exc = payload
                     # 监控失败不弹窗：网络抖一下就弹一次，会把人心态搞崩
                     self._append_log(f"自动刷新失败（{key}）：{exc}")
+                elif kind == "tun_dump":
+                    name, data = payload
+                    self._tun_dumping.discard(name)
+                    if data:
+                        self._tun_dump[name] = data
+                    self._update_tunnel_detail_live()
                 elif kind == "update_ok":
                     self._on_update_info(payload)
                 elif kind == "update_fail":
@@ -772,6 +1017,9 @@ class App:
             state="disabled" if (self.busy or connecting) else "normal"
         )
         self.disconnect_btn.configure(state="normal" if (connected and not self.busy) else "disabled")
+        # 组网页的按钮也跟着 busy 一起变，不然连隧道的时候还能重复点
+        if hasattr(self, "tun_up_btn"):
+            self._tunnel_buttons()
 
     def _collect_conn(self) -> dict:
         host = self.host_var.get().strip()
@@ -804,7 +1052,30 @@ class App:
             "conf_path": self.adv_conf.get().strip(),
             "iface": self.adv_iface.get().strip(),
             "endpoint_host": self.adv_endpoint.get().strip(),
+            "tunnel": {"name": self._selected_tunnel_name()},
         }
+
+    def _tunnel_spec(self, conn: dict):
+        """把"服务器配置里选中的隧道名"翻成隧道规格；没选就是 None（直连）。
+
+        配置去隧道仓库里取 —— 服务器配置只记名字，不复制私钥，
+        这样换一份 conf 只改一处。
+        """
+        name = str(_tunnel_of(conn).get("name") or "").strip()
+        if not name:
+            return None
+        conf = self.tunnels.get(name)
+        if not conf.strip():
+            raise tunnel_mod.TunnelError(
+                f"这条服务器配置绑定的组网隧道「{name}」找不到配置。\n"
+                "去「本机组网」页重新导入一份，或在「组网隧道」里改选「直连」。"
+            )
+        host = str((conn or {}).get("host") or "").strip()
+        try:
+            port = int((conn or {}).get("port") or 22)
+        except (TypeError, ValueError):
+            port = 22
+        return tunnel_mod.TunnelSpec(name=name, conf=conf, host=host, port=port)
 
     # -------------------------------------------------------------- 连接管理
     def connect(self) -> None:
@@ -824,6 +1095,15 @@ class App:
         self.conn = conn
 
         def work():
+            # 组网先行：隧道不通就地停下，别让人等一次没意义的 SSH 超时
+            note, tname, tstarted = "", "", False
+            spec = None if conn.get("demo") else self._tunnel_spec(conn)
+            if spec is not None:
+                tname = tunnel_mod.normalize_name(spec.name)
+                result = tunnel_mod.ensure_up(spec, log=self._log)
+                note, tstarted = result.note, result.started
+                self._log("组网：" + note)
+
             backend = make_backend(conn, log=self._log)
             try:
                 target, dep = probe(backend, conn, self._log)
@@ -832,13 +1112,15 @@ class App:
             except ServerMissing as exc:
                 # 保留这条连接，装完直接用，不用重新输密码
                 return {"kind": "missing", "backend": backend, "error": exc,
-                        "key": key, "conn": conn}
+                        "key": key, "conn": conn, "tunnel": note,
+                        "tunnel_name": tname, "tunnel_started": tstarted}
             except Exception:
                 backend.close()
                 raise
             return {"kind": "ok", "backend": backend, "target": target,
                     "dep": dep, "service": svc, "views": views,
-                    "key": key, "conn": conn}
+                    "key": key, "conn": conn, "tunnel": note,
+                    "tunnel_name": tname, "tunnel_started": tstarted}
 
         self._async("连接", work, self._on_connected)
 
@@ -857,8 +1139,16 @@ class App:
             "service": payload["service"],
             "views": payload["views"],
             "label": _server_label(payload["conn"]),
+            "tunnel": payload.get("tunnel", ""),
+            "tunnel_name": payload.get("tunnel_name", ""),
+            "tunnel_started": bool(payload.get("tunnel_started")),
         }
         self.servers[key] = entry
+        # 只记我们自己拉起来的隧道：官方客户端建的、或本来就在跑的，
+        # 退出时不许拆（别人可能正在用）。
+        if entry["tunnel_started"] and entry["tunnel_name"]:
+            self._tunnels_up.add(entry["tunnel_name"])
+        self._update_tunnel_hint()
         self._activate(key)
         self._append_log(f"连接成功：{entry['dep'].summary}")
         for note in entry["dep"].notes:
@@ -888,7 +1178,8 @@ class App:
         self.service = entry["service"]
         self.views = entry["views"]
         self.info_var.set(entry["dep"].summary)
-        self.status_var.set("● 已连接")
+        tname = entry.get("tunnel_name", "")
+        self.status_var.set(f"● 已连接 · 组网 {tname}" if tname else "● 已连接")
         self._fill(entry["views"])
         self._set_buttons()
         self._refresh_server_combo()
@@ -939,8 +1230,10 @@ class App:
         self.sudo_pwd_var.set(unprotect(profile.get("sudo_password", "")))
         self.remember_var.set(
             any(is_sealed(profile.get(k))
-                for k in ("password", "key_passphrase", "sudo_password"))
+                for k in ("password", "key_passphrase", "sudo_password",
+                          "tunnel_conf"))
         )
+        self._apply_tunnel_profile(profile)
         self._on_auth_change()
         self.connect()
 
@@ -1615,6 +1908,11 @@ class App:
             "username": conn["username"], "auth": conn["auth"],
             "key_path": conn.get("key_path", ""),
         }
+        # 组网只记隧道名：配置（含私钥）在隧道仓库里统一存一份，
+        # 服务器配置不复制私钥，将来换 conf 只改一处。
+        tunnel_name = str(_tunnel_of(conn).get("name") or "").strip()
+        if tunnel_name:
+            profile["tunnel_name"] = tunnel_name
         if remember:
             # 只存加密后的口令，密码本身绝不明文落盘。protect() 失败会返回空串，
             # 那就等于没存 —— 降级成"每次重输"，绝不退回明文。
@@ -1658,9 +1956,736 @@ class App:
         self.key_pass_var.set(unprotect(p.get("key_passphrase", "")))
         self.sudo_pwd_var.set(unprotect(p.get("sudo_password", "")))
         self.remember_var.set(
-            any(is_sealed(p.get(k)) for k in ("password", "key_passphrase", "sudo_password"))
+            any(is_sealed(p.get(k)) for k in ("password", "key_passphrase",
+                                              "sudo_password", "tunnel_conf"))
         )
+        self._apply_tunnel_profile(p)
         self._on_auth_change()
+
+    # ------------------------------------------------------------ 本机组网页
+    def _build_tunnels_page(self, page) -> None:
+        """组网页：只管这台电脑的隧道，不碰服务器、不需要 SSH。
+
+        和管理页彻底分开 —— 只想挂个 VPN 的时候不用被迫先连服务器。
+        """
+        head = ttk.Frame(page)
+        head.pack(fill="x", padx=12, pady=(10, 4))
+        ttk.Label(head, text="这台电脑的组网隧道",
+                  font=ui_font(1, "bold")).pack(side="left")
+        ttk.Label(
+            head,
+            text="只做组网，不用连服务器。要管理服务器就切到「密钥管理」页，"
+                 "在「组网隧道」里选一条；服务器有公网就选「直连」。",
+            foreground="#8a8a8a", wraplength=880, justify="left",
+        ).pack(side="left", padx=(12, 0))
+
+        bar = ttk.Frame(page)
+        bar.pack(fill="x", padx=12, pady=(6, 8))
+        self.tun_import_btn = ttk.Button(bar, text="导入 .conf…", width=12,
+                                         command=self._import_tunnel_conf)
+        self.tun_import_btn.pack(side="left")
+        self.tun_up_btn = ttk.Button(bar, text="连接", width=8,
+                                     style="Accent.TButton",
+                                     command=self._connect_tunnel, state="disabled")
+        self.tun_up_btn.pack(side="left", padx=(6, 0))
+        self.tun_down_btn = ttk.Button(bar, text="断开", width=8,
+                                       command=self._disconnect_tunnel,
+                                       state="disabled")
+        self.tun_down_btn.pack(side="left", padx=(4, 0))
+        self.tun_del_btn = ttk.Button(bar, text="删除", width=8,
+                                      command=self._delete_tunnel, state="disabled")
+        self.tun_del_btn.pack(side="left", padx=(4, 0))
+        ttk.Button(bar, text="刷新", width=8,
+                   command=self._refresh_tunnels).pack(side="left", padx=(4, 0))
+        self.tun_status = ttk.Label(bar, text="", foreground="#8a8a8a")
+        self.tun_status.pack(side="right")
+
+        body = ttk.Frame(page)
+        body.pack(fill="x", padx=12, pady=(0, 4))
+        # 列表只占上面一段（6 行），剩下的纵向空间给下面的详情面板 ——
+        # 隧道一般就几条，让表格撑满整屏反而空得难看。
+        cols = ("name", "state", "rx", "tx", "address", "endpoint", "note", "source")
+        titles = {"name": "隧道名", "state": "状态",
+                  "rx": "↓ 实时", "tx": "↑ 实时",
+                  "address": "本机地址", "endpoint": "对端 Endpoint",
+                  "note": "备注", "source": "来源"}
+        widths = {"name": 160, "state": 88, "rx": 84, "tx": 84,
+                  "address": 148, "endpoint": 178, "note": 176, "source": 72}
+        self._tun_col_base = dict(widths)
+        self.tun_tree = ttk.Treeview(body, columns=cols, show="headings",
+                                     height=6, selectmode="browse")
+        for key in cols:
+            self.tun_tree.heading(key, text=titles[key])
+            self.tun_tree.column(
+                key, width=widths[key],
+                anchor="e" if key in ("rx", "tx") else "w",
+                stretch=key in ("note", "endpoint"))
+        self.tun_tree.tag_configure("running", foreground="#0f6e56")
+        self.tun_tree.tag_configure("stopped", foreground="#a05000")
+        self.tun_tree.tag_configure("absent", foreground="#8a8a8a")
+        yscroll = ttk.Scrollbar(body, orient="vertical",
+                                command=self.tun_tree.yview)
+        self.tun_tree.configure(yscrollcommand=yscroll.set)
+        self.tun_tree.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
+        self.tun_tree.bind("<<TreeviewSelect>>", self._on_tunnel_select)
+        self.tun_tree.bind("<Double-1>", lambda _e: self._toggle_tunnel())
+
+        self._build_tunnel_detail(page)
+
+        ttk.Label(
+            page,
+            text="隧道由官方 WireGuard 客户端托管，流量不经过本工具；"
+                 "每次连接 / 断开都会弹一次 Windows 权限确认。"
+                 "速率每秒采一次（只读本机网卡计数，不联网、不动配置）。"
+                 "「来源：客户端」的那些是 WireGuard 客户端自己建的，本工具只能看状态和断开。",
+            foreground="#8a8a8a", wraplength=1100, justify="left",
+        ).pack(fill="x", padx=12, pady=(0, 10))
+
+        # iid -> 隧道名/状态/来源，用来决定按钮能不能点
+        self._tun_row_name: dict[str, str] = {}
+        self._tun_row_state: dict[str, str] = {}
+        self._tun_row_source: dict[str, str] = {}
+
+    def _build_tunnel_detail(self, page) -> None:
+        """选中一条隧道后的详情区：左边字段，右边实时速率曲线。
+
+        这块同时解决两件事：把页面下半部分的空白填上，以及给"到底通没通"
+        一个比状态列更直观的答案（握手时间 + 有没有流量在走）。
+        """
+        box = ttk.LabelFrame(page, text=" 隧道详情 ", padding=(12, 8))
+        box.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+
+        head = ttk.Frame(box)
+        head.pack(fill="x")
+        self.tun_title = ttk.Label(head, text="没有选中隧道",
+                                   font=ui_font(2, "bold"))
+        self.tun_title.pack(side="left")
+        self.tun_badge = ttk.Label(head, text="在上面点一条查看", foreground="#8a8a8a")
+        self.tun_badge.pack(side="left", padx=(10, 0))
+        # 收发两个方向分开染颜色，一眼能看出是下载还是上传在跑
+        self.tun_tx_rate = ttk.Label(head, text="", foreground=TRAFFIC_UP,
+                                     font=ui_font(2, "bold"))
+        self.tun_tx_rate.pack(side="right")
+        self.tun_rx_rate = ttk.Label(head, text="", foreground=TRAFFIC_DOWN,
+                                     font=ui_font(2, "bold"))
+        self.tun_rx_rate.pack(side="right", padx=(0, 16))
+
+        grid = ttk.Frame(box)
+        grid.pack(fill="both", expand=True, pady=(8, 0))
+        grid.columnconfigure(0, weight=0, minsize=340)
+        grid.columnconfigure(1, weight=1)
+        grid.rowconfigure(0, weight=1)
+
+        info = ttk.Frame(grid)
+        info.grid(row=0, column=0, sticky="nsew")
+        self._tun_info_vars: dict[str, tk.StringVar] = {}
+        rows = [
+            ("address", "本机地址"), ("endpoint", "对端 Endpoint"),
+            ("allowed", "允许的 IP"), ("handshake", "最近握手"),
+            ("listen", "监听端口"), ("peerkey", "服务器公钥"),
+            ("psk", "预共享密钥"), ("keepalive", "保活间隔"),
+            ("dns", "DNS"), ("total", "累计流量"),
+        ]
+        for i, (key, label) in enumerate(rows):
+            ttk.Label(info, text=label, foreground="#8a8a8a",
+                      anchor="w").grid(row=i, column=0, sticky="w", pady=2)
+            var = tk.StringVar(value="—")
+            ttk.Label(info, textvariable=var, anchor="w",
+                      wraplength=260, justify="left").grid(
+                row=i, column=1, sticky="w", pady=2, padx=(12, 0))
+            self._tun_info_vars[key] = var
+
+        ttk.Label(
+            info,
+            text="曲线只统计这条隧道的流量：没有收发时贴底是正常的。\n"
+                 "累计值从这次连接开始算，断开后清零。",
+            foreground="#9a9a9a", justify="left", wraplength=320,
+        ).grid(row=len(rows), column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        chart = ttk.Frame(grid)
+        chart.grid(row=0, column=1, sticky="nsew", padx=(18, 0))
+        legend = ttk.Frame(chart)
+        legend.pack(fill="x")
+        ttk.Label(legend, text="实时速率（最近 60 秒）",
+                  foreground="#8a8a8a").pack(side="left")
+        for color, text in ((TRAFFIC_UP, "发送"), (TRAFFIC_DOWN, "接收")):
+            item = ttk.Frame(legend)
+            item.pack(side="right", padx=(12, 0))
+            tk.Canvas(item, width=14, height=4, background=color,
+                      highlightthickness=0).pack(side="left", pady=8)
+            ttk.Label(item, text=text).pack(side="left", padx=(4, 0))
+
+        self.tun_chart = tk.Canvas(chart, height=150, background="#ffffff",
+                                   highlightthickness=1,
+                                   highlightbackground="#d8d8d8")
+        self.tun_chart.pack(fill="both", expand=True, pady=(6, 0))
+        self.tun_chart.bind("<Configure>", lambda _e: self._draw_tunnel_chart())
+        self._draw_tunnel_chart()
+
+    def _refresh_tunnels(self) -> None:
+        """重建列表：本工具管理的 + 官方客户端里已有的（后者只读）。"""
+        tree = getattr(self, "tun_tree", None)
+        if tree is None:
+            return
+        keep = self._selected_tunnel()[1]
+        for iid in tree.get_children():
+            tree.delete(iid)
+        self._tun_row_name.clear()
+        self._tun_row_state.clear()
+        self._tun_row_source.clear()
+        # 重建后 iid 全变了，缓存的 conf 详情按名字存，别跟着 iid 走
+        self._tun_conf_cache.clear()
+
+        mine = {item["name"] for item in self.tunnels.all()}
+        for item in self.tunnels.all():
+            self._insert_tunnel_row(item["name"],
+                                    tunnel_mod.conf_summary(item["conf"]),
+                                    item.get("note", ""), "本工具")
+        # 客户端里建的：配置被客户端加密保存，我们拿不到明文、起不了，
+        # 但状态能看、断开能做，列出来省得两头找。
+        for name in tunnel_mod.installed_tunnels():
+            if name in mine:
+                continue
+            self._insert_tunnel_row(name, {}, "配置在客户端里", "客户端")
+
+        running = sum(1 for s in self._tun_row_state.values() if s == "running")
+        self.tun_status.configure(
+            text=f"共 {len(self._tun_row_name)} 条 · 运行中 {running} 条")
+        # 重建会丢掉选中状态，按名字恢复，免得详情面板莫名其妙变空
+        for iid, name in self._tun_row_name.items():
+            if name == keep:
+                tree.selection_set(iid)
+                break
+        self._tunnel_buttons()
+        self._show_tunnel_detail()
+
+    def _insert_tunnel_row(self, name: str, summary: dict, note: str,
+                           source: str) -> None:
+        state = tunnel_mod.service_state(name)
+        iid = self.tun_tree.insert(
+            "", "end",
+            values=(name, tunnel_mod.STATE_CN.get(state, state),
+                    "—", "—",
+                    summary.get("address") or "—",
+                    summary.get("endpoint") or "—",
+                    note or "", source),
+            tags=(state,))
+        self._tun_row_name[iid] = name
+        self._tun_row_state[iid] = state
+        self._tun_row_source[iid] = source
+
+    def _selected_tunnel(self) -> tuple[str, str, str]:
+        """(iid, 隧道名, 来源)，没选中就是三个空串。"""
+        tree = getattr(self, "tun_tree", None)
+        if tree is None:
+            return "", "", ""
+        sel = tree.selection()
+        if not sel:
+            return "", "", ""
+        iid = sel[0]
+        return iid, self._tun_row_name.get(iid, ""), self._tun_row_source.get(iid, "")
+
+    def _tunnel_buttons(self) -> None:
+        """按钮开关只看两件事：选中的是谁、忙不忙。"""
+        if not hasattr(self, "tun_up_btn"):
+            return
+        iid, _name, source = self._selected_tunnel()
+        state = self._tun_row_state.get(iid, "") if iid else ""
+        busy = self.busy
+        mine = source == "本工具"
+        self.tun_up_btn.configure(
+            state="normal" if (mine and state != "running" and not busy) else "disabled")
+        self.tun_down_btn.configure(
+            state="normal" if (state == "running" and not busy) else "disabled")
+        self.tun_del_btn.configure(
+            state="normal" if (mine and state != "running" and not busy) else "disabled")
+        self.tun_import_btn.configure(state="disabled" if busy else "normal")
+
+    def _goto_tunnels_page(self) -> None:
+        """从管理页跳到组网页（"管理隧道…"按钮）。"""
+        try:
+            self.notebook.select(0)
+        except Exception:
+            return
+        self._refresh_tunnels()
+
+    # ------------------------------------------------------- 隧道的增删连断
+    def _import_tunnel_conf(self) -> None:
+        """导入一份 conf 存进隧道仓库。私钥进内存，落盘一律 DPAPI。"""
+        if not tunnel_mod.available():
+            if messagebox.askyesno(
+                "没有检测到 WireGuard 客户端",
+                "组网要靠官方客户端提供内核驱动，本机没找到 wireguard.exe。\n\n"
+                "打开官方下载页看看？装好之后再回来导入。",
+                parent=self.root,
+            ):
+                open_url(OFFICIAL_INSTALL_PAGE)
+            return
+
+        path = filedialog.askopenfilename(
+            title="选择 WireGuard 配置文件",
+            filetypes=[("WireGuard 配置", "*.conf"), ("所有文件", "*.*")],
+            parent=self.root,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                text = f.read()
+        except OSError as exc:
+            messagebox.showwarning("读不出来", f"{path}\n\n{exc}", parent=self.root)
+            return
+
+        problems = tunnel_mod.validate_conf(text)
+        if problems:
+            messagebox.showwarning(
+                "这个 conf 用不了",
+                "发现以下问题：\n\n• " + "\n• ".join(problems),
+                parent=self.root,
+            )
+            return
+
+        base = os.path.splitext(os.path.basename(path))[0]
+        try:
+            name = self.tunnels.put(base, text, note=os.path.basename(path))
+        except tunnel_mod.TunnelError as exc:
+            messagebox.showwarning("保存失败", str(exc), parent=self.root)
+            return
+
+        self._refresh_tunnels()
+        self._refresh_tunnel_combo()
+        self._append_log(f"已导入组网配置 {os.path.basename(path)}，隧道名 {name}")
+        for note in tunnel_mod.conf_notes(text):
+            self._append_log("提示：" + note)
+        # 顺带选中刚导入的这条，省得再去列表里翻
+        for iid, row_name in self._tun_row_name.items():
+            if row_name == name:
+                self.tun_tree.selection_set(iid)
+                self.tun_tree.see(iid)
+                break
+
+    def _connect_tunnel(self) -> None:
+        _iid, name, source = self._selected_tunnel()
+        if not name:
+            return
+        if source != "本工具":
+            messagebox.showinfo(
+                "这条隧道不归本工具管",
+                f"「{name}」是 WireGuard 客户端里建的，配置被客户端加密保存，"
+                "本工具拿不到明文，起不了它。\n\n"
+                "两条路：在客户端里点连接；或者把对应的 .conf 导入本工具，"
+                "以后就能在这里一键连。",
+                parent=self.root,
+            )
+            return
+        conf = self.tunnels.get(name)
+        if not conf:
+            messagebox.showwarning(
+                "配置丢了", f"「{name}」的配置解不开，重新导入一份即可。",
+                parent=self.root)
+            return
+
+        self.tun_status.configure(text=f"正在连接 {name} …")
+
+        def done(result):
+            # 记下来，"退出时断开组网"那个开关才拆得到它
+            if getattr(result, "started", False):
+                self._tunnels_up.add(name)
+            # 新会话从头画曲线，别接着上一次的速率
+            self._tun_hist.pop(name, None)
+            self._tun_prev.pop(name, None)
+            self._after_tunnel_action(getattr(result, "note", str(result)))
+
+        self._async("连接组网隧道",
+                    lambda: tunnel_mod.start(name, conf, log=self._log), done)
+
+    def _disconnect_tunnel(self) -> None:
+        _iid, name, _source = self._selected_tunnel()
+        if not name:
+            return
+        if not messagebox.askyesno(
+            "断开组网隧道",
+            f"断开隧道「{name}」？\n\n"
+            "这台电脑上走这条隧道的连接都会断（包括别的程序正在用的）。",
+            parent=self.root,
+        ):
+            return
+        self.tun_status.configure(text=f"正在断开 {name} …")
+
+        def done(msg):
+            self._tunnels_up.discard(name)
+            self._tun_hist.pop(name, None)
+            self._tun_prev.pop(name, None)
+            self._tun_dump.pop(name, None)
+            self._after_tunnel_action(msg)
+
+        self._async("断开组网隧道",
+                    lambda: tunnel_mod.down(name, log=self._log), done)
+
+    def _delete_tunnel(self) -> None:
+        _iid, name, source = self._selected_tunnel()
+        if not name or source != "本工具":
+            return
+        if not messagebox.askyesno(
+            "删除隧道配置",
+            f"从本工具删掉「{name}」的配置？\n\n"
+            "只删本机存的这份配置，不动服务器上的密钥，也不动官方客户端的隧道。",
+            icon="warning", parent=self.root,
+        ):
+            return
+        if self.tunnels.drop(name):
+            self._append_log(f"已删除组网配置 {name}")
+        self._tun_hist.pop(name, None)
+        self._tun_prev.pop(name, None)
+        self._tun_dump.pop(name, None)
+        self._tun_conf_cache.pop(name, None)
+        self._refresh_tunnels()
+        self._refresh_tunnel_combo()
+
+    def _toggle_tunnel(self) -> None:
+        """双击一行：没连就连，连着的就断。"""
+        iid, _name, _source = self._selected_tunnel()
+        if not iid:
+            return
+        if self._tun_row_state.get(iid) == "running":
+            self._disconnect_tunnel()
+        else:
+            self._connect_tunnel()
+
+    def _after_tunnel_action(self, msg: str) -> None:
+        self._append_log(msg)
+        self.tun_status.configure(text=msg)
+        self._refresh_tunnels()
+        self._refresh_tunnel_combo()
+        self._update_tunnel_hint()
+
+    # ------------------------------------------------ 实时速率与详情面板
+    def _on_tunnel_select(self, _event=None) -> None:
+        self._tunnel_buttons()
+        self._show_tunnel_detail()
+
+    def _tunnel_conf(self, name: str, source: str) -> str:
+        """取这条隧道的明文配置。客户端建的拿不到，只缓存本工具的那些。
+
+        缓存是必要的：``tunnels.get`` 每次都要走一次 DPAPI 解密，
+        每秒刷一次详情等于每秒解密一次，纯浪费。
+        """
+        if not name or source != "本工具":
+            return ""
+        if name not in self._tun_conf_cache:
+            self._tun_conf_cache[name] = self.tunnels.get(name) or ""
+        return self._tun_conf_cache[name]
+
+    def _show_tunnel_detail(self) -> None:
+        """选中变化时重建整个详情区。"""
+        if not hasattr(self, "tun_title"):
+            return
+        iid, name, source = self._selected_tunnel()
+        self._tun_sel = name
+        if not name:
+            self.tun_title.configure(text="没有选中隧道")
+            self.tun_badge.configure(text="在上面点一条查看", foreground="#8a8a8a")
+            self.tun_rx_rate.configure(text="")
+            self.tun_tx_rate.configure(text="")
+            for var in self._tun_info_vars.values():
+                var.set("—")
+            self._draw_tunnel_chart()
+            return
+
+        state = self._tun_row_state.get(iid, "")
+        detail = tunnel_mod.conf_detail(self._tunnel_conf(name, source))
+        self.tun_title.configure(text=name)
+        self.tun_badge.configure(
+            text=f"{tunnel_mod.STATE_CN.get(state, state)} · 来源：{source}",
+            foreground="#0f6e56" if state == "running" else "#8a8a8a")
+        v = self._tun_info_vars
+        v["address"].set(detail.get("address") or "—")
+        v["endpoint"].set(detail.get("endpoint") or "—")
+        allowed = detail.get("allowed") or ""
+        v["allowed"].set(allowed or "—")
+        v["listen"].set(detail.get("listen_port") or "启动后自动分配")
+        key = detail.get("peer_key") or ""
+        if key:
+            v["peerkey"].set(tunnel_mod.short_key(key, 12, 8))
+        else:
+            v["peerkey"].set("配置在客户端里，读不到"
+                             if source != "本工具" else "—")
+        psk = ("已启用" if detail.get("preshared") else "未启用")
+        if source != "本工具":
+            psk = "配置在客户端里，读不到"
+        v["psk"].set(psk)
+        ka = detail.get("keepalive") or ""
+        v["keepalive"].set(f"{ka} 秒" if ka and ka != "0" else "未设置")
+        v["dns"].set(detail.get("dns") or "—")
+        self._update_tunnel_detail_live()
+
+    def _update_tunnel_detail_live(self) -> None:
+        """只刷新会变的那几个数：速率、握手、累计流量、曲线。"""
+        name = getattr(self, "_tun_sel", "")
+        if not name or not hasattr(self, "tun_rx_rate"):
+            return
+        iid = next((i for i, n in self._tun_row_name.items() if n == name), "")
+        state = self._tun_row_state.get(iid, "")
+        hist = self._tun_hist.get(name) or []
+        if hist:
+            rx_bps, tx_bps = hist[-1]
+            self.tun_rx_rate.configure(text=f"↓ {human_rate(rx_bps)}")
+            self.tun_tx_rate.configure(text=f"↑ {human_rate(tx_bps)}")
+        else:
+            self.tun_rx_rate.configure(text="")
+            self.tun_tx_rate.configure(text="")
+
+        prev = self._tun_prev.get(name)
+        if prev:
+            self._tun_info_vars["total"].set(
+                f"↓ {human_bytes(prev[1])}    ↑ {human_bytes(prev[2])}")
+        else:
+            self._tun_info_vars["total"].set("—")
+
+        dump = self._tun_dump.get(name) or {}
+        peers = dump.get("peers") or []
+        handshake = max((p.get("handshake", 0) for p in peers), default=0)
+        if state != "running":
+            self._tun_info_vars["handshake"].set("隧道没在运行")
+        elif not dump:
+            self._tun_info_vars["handshake"].set("读不到（wg 权限不足或隧道刚启动）")
+        elif handshake:
+            self._tun_info_vars["handshake"].set(self._ago(handshake))
+        else:
+            self._tun_info_vars["handshake"].set("还没握手 · 对面没回应")
+        port = dump.get("listen_port") or 0
+        if port and state == "running":
+            self._tun_info_vars["listen"].set(str(port))
+        if peers:
+            # 运行中用 wg 的真实值覆盖 conf 里的静态值：保活可能被改过、
+            # 对端也可能是漫游后的新地址
+            first = peers[0]
+            endpoint = first.get("endpoint") or ""
+            if endpoint:
+                self._tun_info_vars["endpoint"].set(endpoint)
+            if first.get("allowed"):
+                self._tun_info_vars["allowed"].set(first["allowed"])
+            self._tun_info_vars["psk"].set(
+                "已启用" if first.get("preshared") else "未启用")
+            ka = str(first.get("keepalive") or "")
+            self._tun_info_vars["keepalive"].set(
+                f"{ka} 秒" if ka and ka != "0" else "未设置")
+
+    @staticmethod
+    def _ago(ts: float) -> str:
+        delta = max(0, int(time.time() - ts))
+        if delta < 60:
+            return f"{delta} 秒前"
+        if delta < 3600:
+            return f"{delta // 60} 分钟前"
+        if delta < 86400:
+            return f"{delta // 3600} 小时前"
+        return f"{delta // 86400} 天前"
+
+    def _draw_tunnel_chart(self) -> None:
+        """把最近 60 次采样画成两条折线。最右边是"现在"。"""
+        cv = getattr(self, "tun_chart", None)
+        if cv is None:
+            return
+        cv.delete("all")
+        w = max(cv.winfo_width(), 240)
+        h = max(cv.winfo_height(), 80)
+        name = getattr(self, "_tun_sel", "")
+        hist = (self._tun_hist.get(name) or []) if name else []
+        if not hist:
+            cv.create_text(
+                w / 2, h / 2,
+                text=("连接后这里会显示实时速率" if name
+                      else "选中一条隧道，查看实时速率和历史曲线"),
+                fill="#999999", font=ui_font(0))
+            return
+
+        # 左边留 74：Y 轴要放得下「800.0 KB/s」这种最长刻度，
+        # 56 的时候末尾会被画布边缘裁掉（截图上显示成 "00.0 KB/s"）
+        # 左边距要放得下最长刻度（「800.0 KB/s」），字大了得留更宽
+        pad_l = max(74, int(round(74 * getattr(self.fonts, "base", 10) / 10)))
+        pad_r, pad_t, pad_b = 14, 12, 24
+        plot_w = max(w - pad_l - pad_r, 40)
+        plot_h = max(h - pad_t - pad_b, 24)
+        slots = 60
+        peak = max(max(s[0], s[1]) for s in hist)
+        ymax = nice_rate_ceiling(max(peak, 1024))
+        for frac in (0.0, 0.5, 1.0):
+            y = pad_t + plot_h * (1 - frac)
+            cv.create_line(pad_l, y, pad_l + plot_w, y,
+                           fill="#eeeeee" if frac else "#dddddd")
+            if frac:  # 0 那格和最下面的时间刻度会挤在一起，省掉
+                cv.create_text(pad_l - 8, y, anchor="e",
+                               text=human_rate(ymax * frac),
+                               fill="#9a9a9a", font=ui_font(-2))
+        # 时间刻度要留出字高，贴着 h-4 画会被画布下边缘切掉半个字
+        cv.create_text(pad_l, h - 9, anchor="w", text="60 秒前",
+                       fill="#b0b0b0", font=ui_font(-2))
+        cv.create_text(pad_l + plot_w, h - 9, anchor="e", text="现在",
+                       fill="#b0b0b0", font=ui_font(-2))
+
+        # 贴着右边画：刚连上时曲线从右往左长，比从左边挤一条更符合直觉
+        offset = slots - len(hist)
+        for idx, color in ((0, TRAFFIC_DOWN), (1, TRAFFIC_UP)):
+            pts: list[float] = []
+            for i, sample in enumerate(hist):
+                x = pad_l + plot_w * ((offset + i) / (slots - 1))
+                y = pad_t + plot_h * (
+                    1 - min(sample[idx], ymax) / ymax)
+                pts.extend((x, y))
+            if len(pts) >= 4:
+                cv.create_line(*pts, fill=color, width=2)
+            elif pts:
+                cv.create_oval(pts[-2] - 2, pts[-1] - 2,
+                               pts[-2] + 2, pts[-1] + 2, fill=color,
+                               outline="")
+
+    # ------------------------------------------------------- 每秒采样
+    def _tunnel_page_visible(self) -> bool:
+        """组网页在前台且窗口没被隐藏时才采样，托盘里躺着就别费 CPU。"""
+        try:
+            if self.notebook.index("current") != 0:
+                return False
+            return self.root.state() not in ("withdrawn", "iconic")
+        except Exception:
+            return False
+
+    def _tunnel_tick(self) -> None:
+        self._tun_job = None
+        try:
+            self._sample_tunnels()
+        except Exception:
+            pass  # 采样失败不该影响正常使用，下一拍再试
+        self._tun_job = self.root.after(1000, self._tunnel_tick)
+
+    def _sample_tunnels(self) -> None:
+        tree = getattr(self, "tun_tree", None)
+        if tree is None or not self._tunnel_page_visible():
+            return
+        now = time.monotonic()
+        counters = tunnel_mod.if_counters()
+        for iid, state in list(self._tun_row_state.items()):
+            name = self._tun_row_name.get(iid, "")
+            if not name:
+                continue
+            if state != "running":
+                # 断开后清掉累计值：Windows 会把虚拟网卡留着，
+                # 复用上一次的数字等于显示一条并不存在的曲线
+                self._tun_prev.pop(name, None)
+                continue
+            cur = counters.get(name.lower())
+            if cur is None:
+                continue
+            prev = self._tun_prev.get(name)
+            rx_bps = tx_bps = 0.0
+            if prev is not None:
+                dt = now - prev[0]
+                # 累计值变小 = 隧道重连过，差值没有意义，这一拍记 0
+                if 0.2 <= dt <= 15:
+                    rx_bps = max(0, cur[0] - prev[1]) / dt
+                    tx_bps = max(0, cur[1] - prev[2]) / dt
+            self._tun_prev[name] = (now, cur[0], cur[1])
+            hist = self._tun_hist.setdefault(name, [])
+            hist.append((rx_bps, tx_bps))
+            del hist[:-120]
+            tree.set(iid, "rx", human_rate(rx_bps))
+            tree.set(iid, "tx", human_rate(tx_bps))
+
+        self._update_tunnel_detail_live()
+        self._draw_tunnel_chart()
+        self._pump_tunnel_dump(now)
+
+    def _pump_tunnel_dump(self, now: float) -> None:
+        """握手时间只有 ``wg show`` 给，放线程里跑，别卡主线程。
+
+        每 2 秒一次、同一时刻只允许一个在跑 —— 它是个 subprocess，
+        超时 3 秒，主线程里等就是整个界面卡 3 秒。
+        """
+        name = getattr(self, "_tun_sel", "")
+        if not name or name in self._tun_dumping:
+            return
+        if now - self._tun_dump_at < 2.0:
+            return
+        iid = next((i for i, n in self._tun_row_name.items() if n == name), "")
+        if self._tun_row_state.get(iid) != "running":
+            return
+        self._tun_dump_at = now
+        self._tun_dumping.add(name)
+
+        def work():
+            try:
+                data = tunnel_mod.wg_dump(name)
+            except Exception:
+                data = {}
+            self.queue.put(("tun_dump", (name, data)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # --------------------------------------------- 管理页：挑一条已有隧道
+    def _refresh_tunnel_combo(self) -> None:
+        """管理页的组网下拉只列本工具能拉起的隧道（客户端那些起不了）。"""
+        combo = getattr(self, "tunnel_combo", None)
+        if combo is None:
+            return
+        values = [DIRECT_TUNNEL] + self.tunnels.names()
+        combo["values"] = values
+        if self.tunnel_var.get() not in values:
+            self.tunnel_var.set(DIRECT_TUNNEL)
+        self._update_tunnel_hint()
+
+    def _selected_tunnel_name(self) -> str:
+        if not hasattr(self, "tunnel_var"):
+            return ""
+        value = self.tunnel_var.get().strip()
+        return "" if value == DIRECT_TUNNEL else value
+
+    def _update_tunnel_hint(self) -> None:
+        """一行说明选中的隧道现在什么状态，别让人猜"到底会不会连隧道"。"""
+        label = getattr(self, "tunnel_hint", None)
+        if label is None:
+            return
+        name = self._selected_tunnel_name()
+        if not name:
+            label.configure(text="直连，不经过组网", foreground="#8a8a8a")
+            return
+        state = tunnel_mod.service_state(name)
+        text = _TUNNEL_HINT.get(
+            state,
+            "连接时自动处理（当前："
+            + tunnel_mod.STATE_CN.get(state, state) + "）")
+        label.configure(text=text, foreground="#0f6e56")
+
+    def _apply_tunnel_profile(self, profile: dict) -> None:
+        """把配置档里记的隧道名填回下拉。"""
+        combo = getattr(self, "tunnel_combo", None)
+        if combo is None:
+            return
+        name = str(profile.get("tunnel_name") or "")
+        self.tunnel_var.set(name if name in combo["values"] else DIRECT_TUNNEL)
+        self._update_tunnel_hint()
+
+    def _migrate_tunnel_profiles(self) -> None:
+        """上一版把组网 conf 直接塞在服务器配置里，挪进隧道仓库、只留名字。
+
+        不迁移的话用户刚导入的那份配置会失效，得重新导一遍。
+        """
+        profiles = _load_profiles()
+        changed = False
+        for profile in profiles:
+            if "tunnel_conf" not in profile:
+                continue
+            conf = unprotect(profile.pop("tunnel_conf", ""))
+            changed = True
+            if not conf.strip():
+                continue
+            try:
+                profile["tunnel_name"] = self.tunnels.put(
+                    profile.get("tunnel_name") or "tunnel", conf)
+            except Exception:
+                profile.pop("tunnel_name", None)
+        if changed:
+            _save_profiles(profiles)
 
     def _on_close(self) -> None:
         """点窗口的 ×：托盘在跑就藏起来，否则真的退出。"""
@@ -1684,6 +2709,19 @@ class App:
             except Exception:
                 pass
             self._poll_job = None
+        if self._tun_job is not None:
+            try:
+                self.root.after_cancel(self._tun_job)
+            except Exception:
+                pass
+            self._tun_job = None
+        # 托盘是延时 800ms 启动的，程序要是关得比这还快，得把这个定时器也撤了
+        if self._tray_job is not None:
+            try:
+                self.root.after_cancel(self._tray_job)
+            except Exception:
+                pass
+            self._tray_job = None
         if self.tray is not None:
             self.tray.stop()
             self.tray = None
@@ -1697,7 +2735,22 @@ class App:
                 self.backend.close()
             except Exception:
                 pass
+        if self.settings.get("tunnel_disconnect_on_exit", False) and self._tunnels_up:
+            self._teardown_tunnels()
         self.root.destroy()
+
+    def _teardown_tunnels(self) -> None:
+        """退出时拆掉本次自己拉起来的隧道。
+
+        同步做：UAC 会在这一刻弹出来，而窗口还在，用户知道发生了什么。
+        放到 destroy 之后弹就成了"程序都关了还蹦出个权限框"，很吓人。
+        """
+        for name in list(self._tunnels_up):
+            try:
+                self._append_log(tunnel_mod.down(name))
+            except Exception as exc:
+                self._append_log(f"断开组网隧道 {name} 失败：{exc}")
+        self._tunnels_up.clear()
 
     # ------------------------------------------------------ 托盘 / 设置
     def show_settings(self) -> None:
@@ -1900,7 +2953,7 @@ class EditDialog:
         key_row = ttk.Frame(frame)
         key_row.grid(row=len(rows), column=0, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Label(key_row, text="公钥：", width=13, anchor="e").pack(side="left")
-        ttk.Label(key_row, text=view.pubkey, font=("Consolas", 9)).pack(side="left")
+        ttk.Label(key_row, text=view.pubkey, font=mono_font(-1)).pack(side="left")
         ttk.Label(key_row, text="（不可修改）", foreground="#777777").pack(side="left", padx=(6, 0))
 
         quick = ttk.Frame(frame)
@@ -2013,7 +3066,7 @@ class ClientConfDialog:
         ).pack(fill="x", pady=(0, 8))
         ttk.Label(frame, text="客户端配置（含私钥，请妥善保管）：",
                   foreground="#a05000").pack(anchor="w")
-        text = scrolledtext.ScrolledText(frame, height=16, font=("Consolas", 10))
+        text = scrolledtext.ScrolledText(frame, height=16, font=mono_font(0))
         text.pack(fill="both", expand=True, pady=6)
         text.insert("1.0", result.client_conf)
         text.configure(state="disabled")
@@ -2082,7 +3135,7 @@ class SavedConfDialog:
             justify="left", wraplength=640,
         ).pack(fill="x", pady=(0, 8))
 
-        text = scrolledtext.ScrolledText(frame, height=16, font=("Consolas", 10))
+        text = scrolledtext.ScrolledText(frame, height=16, font=mono_font(0))
         text.pack(fill="both", expand=True, pady=6)
         text.insert("1.0", entry["conf"])
         text.configure(state="disabled")
@@ -2202,7 +3255,7 @@ class HistoryDialog:
         right = ttk.Frame(body)
         right.pack(side="left", fill="both", expand=True, padx=(10, 0))
         self.preview = scrolledtext.ScrolledText(right, height=15, wrap="none",
-                                                 font=("Consolas", 9))
+                                                 font=mono_font(-1))
         self.preview.pack(fill="both", expand=True)
         self.preview.configure(state="disabled")
 
@@ -2489,7 +3542,7 @@ class TrafficDialog:
         h = max(self.canvas.winfo_height(), 150)
         self.canvas.create_text(w / 2, h / 2, text=message, fill="#999999",
                                 justify="center", width=max(w - 60, 160),
-                                font=(CN_FONT, 10))
+                                font=ui_font(0))
         self.stats.configure(text="")
         self.hint.configure(text="")
 
@@ -2535,7 +3588,7 @@ class TrafficDialog:
             y = pad_t + plot_h * i / 4
             self.canvas.create_line(pad_l, y, pad_l + plot_w, y, fill="#ededed")
             self.canvas.create_text(pad_l - 8, y, anchor="e", fill="#888888",
-                                    font=(CN_FONT, 8),
+                                    font=ui_font(-2),
                                     text=human_rate(ymax * (1 - i / 4)))
 
         # X 轴时间标签
@@ -2544,7 +3597,7 @@ class TrafficDialog:
             x = pad_l + plot_w * i / 4
             fmt = "%H:%M" if seconds <= 86400 else "%m-%d"
             self.canvas.create_text(x, pad_t + plot_h + 12, anchor="n",
-                                    fill="#888888", font=(CN_FONT, 8),
+                                    fill="#888888", font=ui_font(-2),
                                     text=time.strftime(fmt, time.localtime(ts)))
 
         def xy(ts, val):
@@ -2598,7 +3651,7 @@ class TrafficDialog:
         item = self.canvas.create_text(
             x + (8 if anchor == "nw" else -8), pad_t + 6, text=text,
             anchor=anchor, justify="left", fill="#333333",
-            font=(CN_FONT, 8), tags="hover")
+            font=ui_font(-2), tags="hover")
         bbox = self.canvas.bbox(item)
         if bbox:
             rect = self.canvas.create_rectangle(
@@ -2685,12 +3738,12 @@ class DownloadDialog:
         frame.pack(fill="both", expand=True)
 
         ttk.Label(frame, text="密钥配置有了，客户端还没装的话从这里下（均为官方地址）：",
-                  font=(CN_FONT, 10, "bold")).grid(
+                  font=ui_font(0, "bold")).grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
         for i, item in enumerate(CLIENTS, start=1):
             ttk.Label(frame, text=item["platform"], width=13, anchor="w",
-                      font=(CN_FONT, 10, "bold")).grid(row=i, column=0, sticky="w", pady=5)
+                      font=ui_font(0, "bold")).grid(row=i, column=0, sticky="w", pady=5)
             ttk.Label(frame, text=item["hint"], wraplength=380, justify="left",
                       foreground="#555555").grid(row=i, column=1, sticky="w", padx=(8, 14))
             ttk.Button(frame, text=item["action"], width=8,
@@ -2800,6 +3853,47 @@ class SettingsDialog:
         ttk.Label(row, text="掉线 / 上线只在状态翻转时记一条日志",
                   foreground="#8a8a8a").pack(side="left", padx=(10, 0))
 
+        ttk.Separator(frame).pack(fill="x", pady=12)
+
+        # ---------------------------------------------------------- 界面字号
+        font_row = ttk.Frame(frame)
+        font_row.pack(fill="x")
+        ttk.Label(font_row, text="界面字号：").pack(side="left")
+        self._font_sizes = [("小", 9), ("标准", 10), ("大", 11), ("特大", 12)]
+        cur_size = int(self.settings.get("ui_font_size", 10))
+        self.font_var = tk.StringVar(
+            value=next((t for t, s in self._font_sizes if s == cur_size), "标准"))
+        font_combo = ttk.Combobox(font_row, textvariable=self.font_var,
+                                  state="readonly", width=8,
+                                  values=[t for t, _ in self._font_sizes])
+        font_combo.pack(side="left")
+        font_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_font_size())
+        ttk.Label(font_row, text="立即生效，只影响界面显示，不改任何配置",
+                  foreground="#8a8a8a").pack(side="left", padx=(10, 0))
+
+        ttk.Separator(frame).pack(fill="x", pady=12)
+
+        # ---------------------------------------------------------- 组网
+        self.tunnel_exit_var = tk.BooleanVar(
+            value=bool(self.settings.get("tunnel_disconnect_on_exit", False)))
+        ttk.Checkbutton(
+            frame, text="退出程序时断开本程序建立的组网隧道",
+            variable=self.tunnel_exit_var, command=self._on_tunnel_exit,
+        ).pack(anchor="w")
+        client = tunnel_mod.client_path()
+        ttk.Label(
+            frame,
+            text=("WireGuard 客户端：" + client) if client
+                 else "没有检测到 WireGuard 客户端，组网功能用不了",
+            foreground="#8a8a8a", wraplength=520, justify="left",
+        ).pack(anchor="w", padx=(20, 0), pady=(4, 0))
+        ttk.Label(
+            frame,
+            text="默认不断开：隧道是 Windows 服务，别的程序可能还在用。"
+                 "只有本程序亲手拉起来的才会被拆，官方客户端建的不动。",
+            foreground="#8a8a8a", wraplength=520, justify="left",
+        ).pack(anchor="w", padx=(20, 0), pady=(2, 0))
+
         ttk.Label(
             frame,
             text="自动刷新和流量采样都依赖工具开着。关掉程序后不会再采任何数据；\n"
@@ -2814,7 +3908,17 @@ class SettingsDialog:
         ttk.Button(buttons, text="打开数据目录", width=13,
                    command=self._open_dir).pack(side="left")
 
-        show_dialog(top, parent, width=620, height=380)
+        show_dialog(top, parent, width=620)
+
+    def _on_font_size(self) -> None:
+        size = next((s for t, s in self._font_sizes if t == self.font_var.get()),
+                    10)
+        self.app._append_log(self.app.set_ui_font_size(size))
+        # 对话框自己也用了命名字体，改完要按新尺寸重新摆一次，
+        # 否则文字变大、窗口没变，底部按钮会被切
+        self.top.update_idletasks()
+        self.top.geometry("")
+        center_window(self.top, None, None, self.top.master)
 
     def _on_tray(self) -> None:
         self.app._apply_tray(self.tray_var.get())
@@ -2850,6 +3954,13 @@ class SettingsDialog:
             self.app._schedule_monitor(delay=500)
         self.app._append_log(f"自动刷新间隔改为 {self.interval_var.get()}")
 
+    def _on_tunnel_exit(self) -> None:
+        self.settings.set("tunnel_disconnect_on_exit",
+                          self.tunnel_exit_var.get())
+        self.app._append_log(
+            "退出时将断开本程序建立的组网隧道" if self.tunnel_exit_var.get()
+            else "退出时保留组网隧道（下次打开可直接复用）")
+
     def _open_dir(self) -> None:
         try:
             os.startfile(APP_DIR)  # noqa: S606 - Windows only
@@ -2876,7 +3987,7 @@ class DetailDialog:
         ]
         for i, (k, v) in enumerate(lines):
             ttk.Label(frame, text=k + "：", width=14, anchor="e",
-                      font=(CN_FONT, 10, "bold")).grid(row=i, column=0, sticky="ne", pady=3)
+                      font=ui_font(0, "bold")).grid(row=i, column=0, sticky="ne", pady=3)
             ttk.Label(frame, text=str(v), wraplength=440, justify="left").grid(
                 row=i, column=1, sticky="w", pady=3
             )
@@ -2906,7 +4017,7 @@ class InstallDialog:
         frame.pack(fill="both", expand=True)
 
         ttk.Label(frame, text=f"检测到 {plan.platform.label}，服务器上还没有 WireGuard 服务端",
-                  font=(CN_FONT, 11, "bold")).grid(
+                  font=ui_font(1, "bold")).grid(
             row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(frame, text="下面这些操作会修改服务器系统，确认后才会执行。",
                   foreground="#a05000").grid(
@@ -2963,7 +4074,7 @@ class InstallDialog:
         ttk.Label(frame, text="即将执行：").grid(
             row=6, column=0, columnspan=4, sticky="w", pady=(12, 4))
         self.steps = scrolledtext.ScrolledText(frame, height=8, width=76,
-                                               font=(CN_FONT, 9), wrap="word")
+                                               font=ui_font(-1), wrap="word")
         self.steps.grid(row=7, column=0, columnspan=4, sticky="ew")
         self.steps.configure(state="disabled")
 
@@ -3081,10 +4192,29 @@ class AdvancedDialog:
         show_dialog(top, parent, modal=True)
 
 
-HELP_TEXT = """WireGuard 密钥管理工具 · 使用说明
+HELP_TEXT = """WireGuard 管理台 · 使用说明
+
+【两个页面】
+· 「本机组网」—— 只管这台电脑的 VPN 隧道：导入 .conf、连接 / 断开、看状态，
+  全程不需要服务器，双击一行就是连 / 断。
+· 「密钥管理」—— 连上服务器后增删改密钥。服务器有公网就选「直连」，不用组网。
+
+【本机组网】
+点「导入 .conf…」选一份客户端配置（含私钥），工具会校验结构，再用 Windows DPAPI
+加密存进 tunnels.json。之后双击那条隧道就连上了。
+· 隧道由官方 WireGuard 客户端托管（wireguard.exe /installtunnelservice），
+  流量不经过本工具，本工具关了隧道照常在跑；
+· 连接 / 断开都会弹一次 Windows 权限确认（UAC），必须点「是」；
+· 可以导入多条，互不影响；已在运行的隧道会直接复用，不会重复安装；
+· 官方客户端里自己建的隧道也会列出来（来源写「客户端」），但配置被客户端加密保存，
+  本工具只能看状态和断开，连接不了 —— 想在这里一键连就导入对应的 .conf。
+服务器只能通过 VPN 访问时：先在组网页导好，再到「密钥管理」页的「组网隧道」
+下拉里选中它，服务器 IP 填这台服务器的 VPN 地址（如 10.18.0.1）。
+点「连接」时会先确保隧道起来，端口真通了才建 SSH。
 
 【连接】
 填服务器 IP / SSH 端口 / 用户名，选密码或私钥文件登录后点「连接」。
+「组网隧道」下拉留「直连」就是普通直连；要组网就选一条已经导入的隧道。
 工具会自动探测 wg 命令、/etc/wireguard/*.conf、活动接口、服务端公钥、监听端口和 VPN 网段；
 如果 WireGuard 跑在 Docker 容器里，会尝试通过 docker exec 进入容器管理。
 探测不准时，用「高级设置」手动指定配置文件路径和接口名。

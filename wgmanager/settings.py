@@ -14,6 +14,12 @@ DEFAULTS = {
     "monitor_enabled": True,      # 自动刷新在线状态
     "monitor_interval": 60,       # 秒
     "tray_enabled": True,         # 是否启用托盘
+    # 退出时要不要拆掉本程序建立的本机组网隧道。默认不拆 ——
+    # 隧道是 Windows 服务，别的程序可能正借着它在用。
+    "tunnel_disconnect_on_exit": False,
+    # 界面字号基准（磅）。Tk 默认 10，改这里全界面一起变；
+    # 只影响显示，不影响任何配置内容或写进服务器的东西。
+    "ui_font_size": 10,
 }
 
 
