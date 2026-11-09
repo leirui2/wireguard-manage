@@ -46,6 +46,7 @@ from .updater import (
     fetch_latest,
     fetch_sha,
     is_newer,
+    is_portable,
     pending_update,
     release_line,
     update_dir,
@@ -77,15 +78,76 @@ _TUNNEL_HINT = {
 }
 
 
+#: 装到不可写目录（比如 Program Files）时，数据落到这里
+DATA_FALLBACK = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+    "WireGuard管理台",
+)
+
+#: 回退时值得从旧位置搬过来的东西 —— 都是用户自己攒的配置，
+#: 不搬的话"换了安装位置配置全没了"。clients\ 和 updates\ 体积大且可重建，不搬。
+_STICKY_FILES = ("connections.json", "tunnels.json", "settings.json", "known_hosts")
+
+
+def _writable(folder: str) -> bool:
+    """这个目录能不能真写进去。
+
+    不能用 os.access —— Windows 上它只看只读属性，对 ACL 无效，
+    `C:\\Program Files` 会被误判成可写。所以实测一次创建 / 删除。
+    """
+    probe = os.path.join(folder, ".wgm-write-test")
+    try:
+        with open(probe, "w", encoding="ascii") as fh:
+            fh.write("x")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _migrate_config(from_dir: str, to_dir: str) -> list[str]:
+    """把旧位置的小配置文件搬到新位置，只搬目标没有的那些。返回搬了哪些。"""
+    moved = []
+    for name in _STICKY_FILES:
+        src = os.path.join(from_dir, name)
+        dst = os.path.join(to_dir, name)
+        if not os.path.isfile(src) or os.path.exists(dst):
+            continue
+        try:
+            with open(src, "rb") as fin, open(dst, "wb") as fout:
+                fout.write(fin.read())
+            moved.append(name)
+        except OSError:
+            pass
+    return moved
+
+
 def app_dir() -> str:
     """运行时数据目录。
 
-    打包成 exe（PyInstaller onefile）后，__file__ 指向临时解压目录 _MEIPASS，
-    数据写在那里退出就丢；所以 frozen 时要改用 exe 自己所在的目录。
+    规则：优先放在 exe 自己旁边（绿色版特性，U 盘也能带走）。两种打包形态下
+    __file__ 都可能指向临时解压目录 _MEIPASS，所以 frozen 时用 sys.executable。
+
+    **但 exe 旁边不一定可写**：装到 `C:\\Program Files` 时普通用户没有写权限，
+    配置、导出的客户端 .conf、更新包全都存不下去。这时退到
+    `%LOCALAPPDATA%\\WireGuard管理台`，并把已有的旧配置搬一次，免得用户以为
+    "换了安装位置配置全丢了"。
     """
     if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    if _writable(base):
+        return base
+    try:
+        os.makedirs(DATA_FALLBACK, exist_ok=True)
+        _migrate_config(base, DATA_FALLBACK)
+    except OSError:
+        # 连用户目录都建不出来（极罕见，比如整个 profile 只读）——
+        # 那就还是回原目录，让写入错误发生在具体操作上，而不是启动就崩
+        return base
+    return DATA_FALLBACK
 
 
 APP_DIR = app_dir()
@@ -912,6 +974,23 @@ class App:
                 "发现新版本",
                 detail + "\n\n当前是源码方式运行，不能自动替换。\n"
                 "要打开发行版页面手动下载吗？",
+                parent=self.root,
+            ):
+                open_url(latest.page_url)
+            return
+
+        if is_portable():
+            # 装出来的版本用的是「目录布局」：exe 旁边的 _internal 里那些 DLL
+            # 运行期间全被占用，替换不了。硬替换只会留下一半新一半旧的坏目录，
+            # 比不更新更糟 —— 所以引导用户跑新的安装包，安装包会先关掉旧版再整体替换。
+            self._append_log("检测到新版本；安装版不能在程序内替换，需要下载安装包覆盖安装")
+            if messagebox.askyesno(
+                "发现新版本（安装版）",
+                detail + "\n\n你用的是「安装版」。\n"
+                "它的程序文件在运行期间被占用，没法在程序内自我替换。\n\n"
+                "请到发行版页面下载新的 WireGuardManager-setup.exe 直接覆盖安装，"
+                "安装包会自动关掉旧版本（配置和隧道都保存在数据目录，升级不会丢）。\n\n"
+                "要打开发行版页面吗？",
                 parent=self.root,
             ):
                 open_url(latest.page_url)

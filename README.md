@@ -47,14 +47,40 @@ SHA256 校验值见同一发行版下的 [SHA256.txt](https://github.com/leirui2
 
 ## 快速开始
 
-### 方式一：直接用 exe（推荐给最终用户）
+### 方式一：直接用（推荐给最终用户）
 
-1. 下载 [WireGuardManager.exe](https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager.exe)
-   （或到 [Releases](../../releases) 页面挑历史版本）
+发行版只有两种，**功能完全相同**，按使用习惯选：
+
+| 下载 | 启动到能操作 | 说明 |
+|---|---|---|
+| [WireGuardManager-setup.exe](https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager-setup.exe) | **约 1 秒** | **安装版**：双击安装，开始菜单 + 桌面快捷方式，卸载在「应用和功能」里；可选同时装官方 WireGuard 客户端 |
+| [WireGuardManager.exe](https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager.exe) | 约 5 秒（第 0.6 秒先弹启动图） | 单文件，免安装，**支持程序内自动更新** |
+
+单文件版慢的原因不是代码：它每次启动都要把 **49 MB / 1028 个文件**解到
+`%TEMP%\_MEIxxxx`，实测解压占 2.4 秒，再加上冻结后加载 DLL、杀软扫描，合计约 5 秒。
+安装版把这些文件摊在 `_internal\` 里，直接加载，实测 0.9 秒 —— 这是安装版快的原因。
+
+**安装版怎么装**
+
+1. 双击 `WireGuardManager-setup.exe`
+2. 默认装到 `%LOCALAPPDATA%\Programs\WireGuard 管理台`，**安装位置可以自己改**
+3. 默认**只给当前用户装，全程不弹 UAC**；要给全机装就显式加 `/ALLUSERS`：
+   `WireGuardManager-setup.exe /ALLUSERS /VERYSILENT`
+4. 卸载：安装目录里的「卸载 WireGuard 管理台」、开始菜单同名项，或系统「应用和功能」
+
+装到 `C:\Program Files` 也能用 —— 程序发现安装目录不可写时，会把配置自动放到
+`%LOCALAPPDATA%\WireGuard管理台`，并把旧配置搬过去一次。**两种形态共用同一套配置文件**，
+互相切换时配置能跟着走。
+
+> 安装包未做代码签名，SmartScreen 可能提示"未知发布者"，选「更多信息 → 仍要运行」。
+
+**单文件版怎么用**
+
+1. 下载 `WireGuardManager.exe`
 2. 放到**有写权限的目录**（桌面、D 盘、U 盘都行，**不要放 `C:\Program Files`**）
 3. 双击运行
 
-目标电脑**不需要安装 Python 或任何依赖**，exe 已自带解释器、Tcl/Tk、OpenSSL 和 SSH 库。
+目标电脑**不需要安装 Python 或任何依赖**，已自带解释器、Tcl/Tk、OpenSSL 和 SSH 库。
 
 > 仅支持 64 位 Windows 10 / 11。
 
@@ -82,7 +108,25 @@ python main.py
 双击 打包exe.bat
 ```
 
-约 45 秒，产物在 `dist\WireGuard管理台.exe`。打包环境是项目内的 `.build-venv\`，首次使用需先创建：
+约 3 分钟，一次出两个产物：
+
+| 产物 | 说明 |
+|---|---|
+| `dist\WireGuard管理台.exe` | 单文件版，带启动画面（`build_assets/splash.png`） |
+| `dist\WireGuard管理台-安装包-<版本>.exe` | 安装包（Inno Setup），装完启动 1 秒 |
+
+流程是：写版本号 → 生成启动图（图里印着版本，所以必须在写版本之后）→
+单文件（`wireguard-manager.spec`）→ 目录版布局（`wireguard-manager-onedir.spec`，
+输出到 `build\installer-src\`，**只做安装包原料，不对外发布**）→
+`build_assets\make_installer.py` 编译安装包。
+
+安装包那一步需要 **Inno Setup 6**，没有就自动跳过（`winget install JRSoftware.InnoSetup`）。
+想让它带「同时安装 WireGuard 官方客户端」的勾选项，把
+`wireguard-amd64-<版本>.msi` 放进 `build_assets\` 即可 —— 会先校验 SHA256 与 Authenticode 签名，
+签发给 WireGuard LLC 才打进去。国内网络下官网常被 DNS 污染 / 直连被重置，
+`build_assets\fetch_wireguard_msi.py` 会自动依次试环境变量代理、系统代理、直连。
+
+打包环境是项目内的 `.build-venv\`，首次使用需先创建：
 
 ```bat
 python -m venv .build-venv
@@ -388,6 +432,11 @@ v1.0.11 · [检查更新]   发现新版本 v1.0.12                        [发�
 ```
 下载 17.6 MB → 校验 SHA256 → 生成替换脚本 → 程序退出 → 覆盖自身 → 自动重启
 ```
+
+> **目录版（portable）不支持自动替换**：exe 旁边 `_internal\` 里的 DLL 在运行期间
+> 全被占用，硬替换只会留下半新半旧的坏目录。点「检查更新」会提示你去发行版页面
+> 下载新的 zip 解压覆盖 —— 配置（`connections.json` / `tunnels.json`）都在 exe 旁边，
+> 覆盖不会丢。想让更新全自动的话用单文件版。
 
 ### 三条安全底线
 

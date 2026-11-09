@@ -46,9 +46,21 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+# 启动画面。onefile 每次启动要先把 49 MB 解到 %TEMP%，这期间窗口还不存在；
+# splash 由引导程序画，解压开始前就显示，双击后立刻有反馈。
+# 图片由 build_assets/make_splash.py 生成（版本号写在图里，打包前重跑）。
+splash = Splash(
+    "build_assets/splash.png",
+    binaries=a.binaries,
+    datas=a.datas,
+    always_on_top=True,
+)
+
 exe = EXE(
     pyz,
     a.scripts,
+    splash,
+    splash.binaries,
     a.binaries,
     a.datas,
     [],

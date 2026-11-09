@@ -16,6 +16,8 @@ concurrency:
 
 env:
   EXE_NAME: WireGuardManager.exe
+  # 发行版资产名一律 ASCII：中文在下载链接里要转义，复制传播容易乱码
+  SETUP_NAME: WireGuardManager-setup.exe
 
 jobs:
   build:
@@ -70,6 +72,10 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
+      # 启动图里印着版本号，必须在 stamp 之后生成，否则图上是旧版本
+      - name: Generate splash image
+        run: python build_assets/make_splash.py
+
       - name: Build single-file exe
         run: python -m PyInstaller --noconfirm --clean wireguard-manager.spec
 
@@ -99,6 +105,52 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      # ---- 安装包的料（onedir 布局）：只做安装包输入，不对外发布 ----
+      # 必须放在单文件版的产物检查之后，否则 dist/ 里会多一层同名目录，
+      # 上面那条 `Get-ChildItem dist -Filter *.exe` 就可能挑错。
+      - name: Build installer payload
+        run: python -m PyInstaller --noconfirm --clean --distpath build/installer-src wireguard-manager-onedir.spec
+
+      # ---- 安装包（Inno Setup）----
+      # 可选：把官方客户端 msi 一起打进去。官网在部分网络下不可达，
+      # 所以这一步失败不拦构建 —— 没有 msi 只是少了那个勾选项。
+      - name: Fetch WireGuard client installer (optional)
+        continue-on-error: true
+        run: python build_assets/fetch_wireguard_msi.py
+
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup not found, installing via choco..."
+            choco install innosetup --no-progress -y
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe still missing after install" }
+          Write-Host "Inno Setup ready: $iscc"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ver = (Get-Content version.txt -Raw).Trim()
+          # 发行版资产用 ASCII 名，和 WireGuardManager.exe 保持一致的习惯
+          python build_assets/make_installer.py $ver --out=WireGuardManager-setup
+          $setup = Get-Item "dist/WireGuardManager-setup.exe"
+          Write-Host ("Installer: {0:N1} MB" -f ($setup.Length / 1MB))
+          if ($setup.Length -lt 8MB) { throw "installer looks too small" }
+          Copy-Item $setup.FullName "release/WireGuardManager-setup.exe" -Force
+          $h = (Get-FileHash "release/WireGuardManager-setup.exe" -Algorithm SHA256).Hash
+          Add-Content -Path "release/SHA256.txt" -Value "$h  WireGuardManager-setup.exe" -Encoding ascii
+          Write-Host "Setup SHA256: $h"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WireGuardManager-setup-x64
+          path: release/WireGuardManager-setup.exe
+          retention-days: 30
+          if-no-files-found: error
+
       # ---- 推送到 main / master：每次构建都单独留一条发行版 ----
       # 以前固定复用 tag "latest"，每次覆盖同一条，导致旧版本一个都留不下。
       # 现在 tag 用 "v1.0.<构建号>"，每条独立存在，历史可回溯。
@@ -122,17 +174,27 @@ jobs:
             **分支**：`${{ github.ref_name }}`
 
             ### 下载
-            点下面的 `WireGuardManager.exe` 即可。目标机器 **不需要安装 Python**，
-            也不需要任何运行库，拷贝过去双击就能用。
+            两个文件，功能完全相同，按需选一个：
+
+            | 下载 | 启动速度 | 适合 |
+            |---|---|---|
+            | `WireGuardManager-setup.exe` | **约 1 秒** | **推荐**。双击安装，自动创建开始菜单和桌面快捷方式，卸载在「应用和功能」里 |
+            | `WireGuardManager.exe` | 约 5 秒（每次启动要把运行库解压到临时目录） | 免安装单文件，拷走就能用；支持程序内自动更新 |
+
+            **安装版说明**：默认只给当前用户装，全程不弹 UAC；安装位置可以自己选。
+            装到 `C:\Program Files` 时配置会自动落到 `%LOCALAPPDATA%\WireGuard管理台`。
+            安装包内可选带官方 WireGuard 客户端（默认不勾）。
+
+            目标机器 **不需要安装 Python 或任何运行库**。
 
             - 需要 64 位 Windows 10 / 11
-            - 不要放在 `C:\Program Files`（程序要往自己旁边写配置和客户端文件）
-            - 首次启动约 2~4 秒（单文件包需自解压）
-            - 无代码签名，杀软提示"未知发布者"时选「仍要运行」
+            - 单文件版不要放在 `C:\Program Files`（程序要往自己旁边写配置）
+            - 无代码签名，SmartScreen 提示"未知发布者"时选「更多信息 → 仍要运行」
 
             校验值见 `SHA256.txt`。
             历史版本可以在本仓库的 Releases 页面按 tag 找到。
           files: |
+            release/WireGuardManager-setup.exe
             release/WireGuardManager.exe
             release/SHA256.txt
             release/version.txt
@@ -150,9 +212,11 @@ jobs:
           body: |
             版本 `${{ github.ref_name }}`，由 GitHub Actions 自动构建。
 
-            下载 `WireGuardManager.exe` 直接运行，目标机器无需安装 Python。
-            校验值见 `SHA256.txt`。
+            两种下载：`WireGuardManager-setup.exe`（安装版，推荐）、
+            `WireGuardManager.exe`（单文件免安装）。
+            目标机器无需安装 Python。校验值见 `SHA256.txt`。
           files: |
+            release/WireGuardManager-setup.exe
             release/WireGuardManager.exe
             release/SHA256.txt
             release/version.txt

@@ -268,6 +268,23 @@ def exe_path() -> str:
     return ""
 
 
+def is_portable() -> bool:
+    """当前跑的是不是「目录布局」（安装版就是这种）。
+
+    两种打包形态的自更新方式不一样，必须分清楚：
+
+    * 单文件（onefile）：程序就是一个 exe，下载新的盖掉旧的即可。
+    * 目录布局（onedir，即安装版）：exe 旁边有个 ``_internal`` 目录，程序运行期间
+      那些 DLL 全被占用、盖不掉，所以不能在程序内替换 —— 引导用户下载新的
+      安装包覆盖安装。用 ``_internal`` 是否存在来判断，比看解压路径可靠
+      （onefile 的 ``sys._MEIPASS`` 在 %TEMP%，目录布局的就在 exe 旁边）。
+    """
+    if not getattr(sys, "frozen", False):
+        return False
+    return os.path.isdir(
+        os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "_internal"))
+
+
 def update_dir(app_dir: str) -> str:
     path = os.path.join(app_dir, UPDATE_DIR)
     os.makedirs(path, exist_ok=True)

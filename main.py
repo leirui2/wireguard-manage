@@ -22,16 +22,34 @@ if not FROZEN:
             sys.path.insert(0, path)
 
 
+def _close_splash() -> None:
+    """收掉启动画面。
+
+    只有带 splash 的打包版本才有 ``pyi_splash``；目录版和源码模式 import 不到，
+    这是正常的，不是错误 —— 所以这里一律吞掉异常。
+    """
+    try:
+        import pyi_splash  # type: ignore
+
+        pyi_splash.close()
+    except Exception:
+        pass
+
+
 def main() -> None:
     from wgmanager.gui import App
 
-    App().run()
+    app = App()
+    # 走到这里主窗口已经显示（App.__init__ 末尾会 deiconify），启动图可以退了
+    _close_splash()
+    app.run()
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
+        _close_splash()
         tb = traceback.format_exc()
         try:
             with open(os.path.join(ROOT, "error.log"), "a", encoding="utf-8") as f:
