@@ -69,6 +69,9 @@ _ACTION_BY_LABEL = {v: k for k, v in ACTION_LABELS.items()}
 #: 不可能和这个中文串撞上。
 DIRECT_TUNNEL = "直连（不组网）"
 
+#: 「开机后自动连接」下拉里表示"什么都不连"的那一项。同理，不会撞隧道名。
+BOOT_TUNNEL_NONE = "不组网（只开程序）"
+
 # 管理页那行组网提示。光甩一个状态词没人看得懂，直接说连接时会发生什么。
 _TUNNEL_HINT = {
     "absent": "连接时自动建立（现在还没有）",
@@ -496,7 +499,18 @@ class App:
 
         self._poll_job = None
         self._tray_job = None
+        self._boot_job = None
+        # 这次是不是登录时被系统拉起来的（注册表里带 --boot）。
+        # 手动双击打开时不该自动连隧道 —— 用户就在跟前，突然弹个 UAC 很吓人。
+        self.boot_launch = autostart_mod.is_boot_launch(sys.argv[1:])
         self._build()
+        # 老版本写进注册表的是纯路径（没有 --boot），升级后补一下，
+        # 否则新的「开机自动连隧道」永远不会触发；程序搬家也顺手改过来
+        try:
+            if autostart_mod.refresh():
+                self._append_log("已更新开机自启的启动参数（升级后补齐）")
+        except Exception:
+            pass
         self._refresh_tree_widths()
         self._poll_job = self.root.after(120, self._poll)
         self._tun_job = self.root.after(1000, self._tunnel_tick)
@@ -504,6 +518,10 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         if self.settings.get("tray_enabled", True) and tray_mod.available():
             self._tray_job = self.root.after(800, self._start_tray_if_enabled)
+        # 开机自连放在托盘之后：先把界面摆好，再去做要弹 UAC 的事。
+        # 手动打开时不排这个定时器，省得白跑一拍
+        if self.boot_launch:
+            self._boot_job = self.root.after(2500, self._boot_connect_tunnel)
         self._log("就绪。「本机组网」页可以单独连隧道；「密钥管理」页填服务器信息后点「连接」。"
                   "想先试用可以勾「演示模式」。")
         self._refresh_profile_combo()
@@ -2364,8 +2382,26 @@ class App:
                 "配置丢了", f"「{name}」的配置解不开，重新导入一份即可。",
                 parent=self.root)
             return
+        self._start_tunnel(name, conf)
 
+    def _start_tunnel(self, name: str, conf: str, quiet: bool = False) -> None:
+        """在后台把一条隧道拉起来。
+
+        「连接」按钮和开机自连共用。``quiet=True``（开机自连用）时不弹模态
+        错误框：登录那一刻用户多半还没坐到电脑前，一个弹框只会挡着别的窗口，
+        结果照样进日志，托盘在跑的话再补一条气泡。
+        """
         self.tun_status.configure(text=f"正在连接 {name} …")
+
+        def work():
+            if quiet:
+                try:
+                    return tunnel_mod.start(name, conf, log=self._log)
+                except Exception as exc:  # noqa: BLE001 - 失败要变成日志，不能弹框
+                    self._log(f"开机自连隧道 {name} 失败：{exc}")
+                    return tunnel_mod.TunnelResult(
+                        f"开机自连隧道 {name} 失败：{exc}", False)
+            return tunnel_mod.start(name, conf, log=self._log)
 
         def done(result):
             # 记下来，"退出时断开组网"那个开关才拆得到它
@@ -2374,10 +2410,46 @@ class App:
             # 新会话从头画曲线，别接着上一次的速率
             self._tun_hist.pop(name, None)
             self._tun_prev.pop(name, None)
-            self._after_tunnel_action(getattr(result, "note", str(result)))
+            note = getattr(result, "note", str(result))
+            self._after_tunnel_action(note)
+            if quiet and self.tray and self.tray.running:
+                self.tray.notify(note, "开机自动连接")
 
-        self._async("连接组网隧道",
-                    lambda: tunnel_mod.start(name, conf, log=self._log), done)
+        self._async("连接组网隧道", work, done)
+
+    def _boot_connect_tunnel(self) -> None:
+        """开机自启那一次：把「设置」里指定的隧道自动连上。
+
+        只在带 ``--boot`` 启动时动手。任何一步不满足（没选隧道、客户端被卸了、
+        隧道配置被删了）都只记一行日志然后收工 —— 开机流程不该因为一个
+        可选项把窗口卡住或者弹一串错误框。
+        """
+        self._boot_job = None
+        if not self.boot_launch:
+            return
+        name = str(self.settings.get("autostart_tunnel", "") or "").strip()
+        if not name:
+            self._append_log("开机自启：没有指定要自动连接的隧道，本次不组网。")
+            return
+        if not tunnel_mod.available():
+            self._append_log(
+                f"开机自启：要连隧道 {name}，但没检测到 WireGuard 客户端，跳过。")
+            return
+        conf = self.tunnels.get(name)
+        if not conf:
+            self._append_log(
+                f"开机自启：要连隧道 {name}，但本工具里没有它的配置"
+                "（可能已被删除），本次不组网。到「设置」里重新选一条即可。")
+            return
+        state = tunnel_mod.service_state(name)
+        if state == "running":
+            self._append_log(f"开机自启：隧道 {name} 已经在运行，直接复用。")
+            self._refresh_tunnels()
+            return
+        self._append_log(
+            f"开机自启：正在连接隧道 {name}，稍后会弹一次 Windows 权限确认，"
+            "请点「是」，否则隧道建不起来。")
+        self._start_tunnel(name, conf, quiet=True)
 
     def _disconnect_tunnel(self) -> None:
         _iid, name, _source = self._selected_tunnel()
@@ -2415,6 +2487,10 @@ class App:
             return
         if self.tunnels.drop(name):
             self._append_log(f"已删除组网配置 {name}")
+        # 删掉的正好是「开机自动连接」选中的那条：顺手清空，别留个指不到的设置
+        if str(self.settings.get("autostart_tunnel", "") or "").strip() == name:
+            self.settings.set("autostart_tunnel", "")
+            self._append_log("开机自连的隧道已删除，已把「开机后自动连接」改回不组网")
         self._tun_hist.pop(name, None)
         self._tun_prev.pop(name, None)
         self._tun_dump.pop(name, None)
@@ -2801,6 +2877,13 @@ class App:
             except Exception:
                 pass
             self._tray_job = None
+        # 开机自连也是延时排队的，用户开完立刻关掉就别再弹 UAC 了
+        if self._boot_job is not None:
+            try:
+                self.root.after_cancel(self._boot_job)
+            except Exception:
+                pass
+            self._boot_job = None
         if self.tray is not None:
             self.tray.stop()
             self.tray = None
@@ -3914,6 +3997,33 @@ class SettingsDialog:
             ttk.Label(frame, text=reason, foreground="#8a8a8a", wraplength=520,
                       justify="left").pack(anchor="w", padx=(20, 0))
 
+        # 开机那一次顺手连哪条隧道。选「不组网」就只开程序。
+        boot_row = ttk.Frame(frame)
+        boot_row.pack(anchor="w", padx=(20, 0), pady=(8, 0))
+        ttk.Label(boot_row, text="开机后自动连接：").pack(side="left")
+        names = app.tunnels.names()
+        saved = str(self.settings.get("autostart_tunnel", "") or "").strip()
+        # 配置被删掉时别显示空 —— 把旧名字也塞进下拉，用户才知道原来设的是它
+        choices = [BOOT_TUNNEL_NONE] + names
+        if saved and saved not in names:
+            choices.append(saved)
+        self.boot_tunnel_var = tk.StringVar(
+            value=saved if saved else BOOT_TUNNEL_NONE)
+        self.boot_combo = ttk.Combobox(
+            boot_row, textvariable=self.boot_tunnel_var, state="readonly",
+            width=26, values=choices)
+        self.boot_combo.pack(side="left")
+        self.boot_combo.bind("<<ComboboxSelected>>",
+                             lambda _e: self._on_boot_tunnel())
+        self.boot_hint = ttk.Label(
+            frame, text="", foreground="#8a8a8a", wraplength=520, justify="left")
+        self.boot_hint.pack(anchor="w", padx=(20, 0), pady=(2, 0))
+        self._boot_supported = ok
+        if not ok:
+            # 源码模式 / 非 Windows：写不了注册表，这个选择也就无从生效
+            self.boot_combo.configure(state="disabled")
+        self._refresh_boot_hint()
+
         ttk.Separator(frame).pack(fill="x", pady=12)
 
         # ---------------------------------------------------------- 刷新间隔
@@ -4023,6 +4133,63 @@ class SettingsDialog:
                 return
             self.settings.set("autostart", False)
             self.app._append_log(msg)
+        self._refresh_boot_hint()
+
+    def _boot_tunnel_name(self) -> str:
+        """下拉当前选中的隧道名，选的是「不组网」就是空串。"""
+        value = self.boot_tunnel_var.get()
+        return "" if value == BOOT_TUNNEL_NONE else value
+
+    def _refresh_boot_hint(self) -> None:
+        """说明文字跟着状态走：写不了注册表 / 还没有隧道 / 配置丢了 / 正常。"""
+        if not self._boot_supported:
+            self.boot_hint.configure(
+                text="源码模式或非 Windows 下写不了注册表，这个选择不会生效；"
+                     "打包成 exe 后才可用。",
+                foreground="#b03030")
+            return
+        name = self._boot_tunnel_name()
+        if not self.app.tunnels.names():
+            self.boot_hint.configure(
+                text="本工具里还没导入任何隧道，所以没得选 —— "
+                     "先到「本机组网」页导入 .conf，这里才会出现可选项。",
+                foreground="#a05000")
+            return
+        if name and name not in self.app.tunnels.names():
+            self.boot_hint.configure(
+                text=f"这条隧道（{name}）的配置已经不在本工具里了，开机时会跳过。"
+                     f"请重新选一条，或改回「{BOOT_TUNNEL_NONE}」。",
+                foreground="#b03030")
+            return
+        if not self.auto_var.get():
+            self.boot_hint.configure(
+                text="还没勾选上面的「开机自动启动」—— 勾上之后这里的选择才会生效。\n"
+                     "隧道要靠管理员权限建立，登录后会弹一次权限确认，请点「是」。",
+                foreground="#a05000")
+            return
+        head = (f"登录 Windows 后会自动打开程序并连上 {name}。" if name
+                else "登录 Windows 后只打开程序，不组网。")
+        self.boot_hint.configure(
+            text=head + "隧道要靠管理员权限建立，会弹一次权限确认，请点「是」，"
+                        "否则连不上。\n手动双击打开程序不会自动连。只列本工具导入的隧道 —— "
+                        "客户端自己建的那些拿不到配置，起不了。",
+            foreground="#8a8a8a")
+
+    def _on_boot_tunnel(self) -> None:
+        name = self._boot_tunnel_name()
+        if name and name not in self.app.tunnels.names():
+            # 选到的是配置已经没了的旧条目：清掉更干脆，别让开机一直跳过
+            name = ""
+            self.boot_tunnel_var.set(BOOT_TUNNEL_NONE)
+        self.settings.set("autostart_tunnel", name)
+        if self.auto_var.get():
+            # 重写一遍注册表：命令行里要带 --boot，旧版本写的那份没有
+            ok, msg = autostart_mod.enable()
+            if not ok:
+                messagebox.showwarning("设置失败", msg, parent=self.top)
+        self._refresh_boot_hint()
+        self.app._append_log(
+            f"开机后自动连接隧道 {name}" if name else "开机后不自动连接隧道")
 
     def _on_interval(self) -> None:
         secs = next((s for t, s in self._intervals

@@ -11,6 +11,9 @@ import os
 DEFAULTS = {
     "minimize_to_tray": True,     # 点 × 时藏到托盘而不是退出
     "autostart": False,           # 开机自动启动（写注册表）
+    # 开机自启那一次要顺手连哪条本机组网隧道。空串 = 只开程序、不组网。
+    # 存隧道名（wgm- 前缀的那种），不是 conf —— 配置在 tunnels.json 里。
+    "autostart_tunnel": "",
     "monitor_enabled": True,      # 自动刷新在线状态
     "monitor_interval": 60,       # 秒
     "tray_enabled": True,         # 是否启用托盘

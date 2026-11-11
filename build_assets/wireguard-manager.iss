@@ -43,6 +43,12 @@ AppSupportURL=https://github.com/leirui2/wireguard-manage/issues
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+; 「选择安装位置」页必须每次都显示。
+; Inno 的默认值是 auto —— 一旦发现上次装过的目录就直接跳过这一页，
+; 沿用旧路径（UsePreviousAppDir 的默认行为）。结果就是升级时想把程序
+; 从 D:\Program Files 挪回默认目录、或者换个盘，都没机会改。
+; 显式写 no：升级时这一页照样出现，路径预填上次的目录，用户随时可改。
+DisableDirPage=no
 AllowNoIcons=yes
 ; 默认只给当前用户装，全程不弹 UAC。要给全机装就显式加 /ALLUSERS 参数，
 ; 不加 dialog —— 那个"仅为我/为所有用户"的选择页对最终用户是多余的一道坎。

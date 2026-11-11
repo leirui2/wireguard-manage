@@ -73,6 +73,11 @@ class TestSettings(SettingsTestCase):
         for key in DEFAULTS:
             self.assertIsNotNone(s.data.get(key))
 
+    def test_autostart_tunnel_defaults_to_none(self):
+        # 空串 = 开机只开程序、不组网。默认必须是空，别替用户连 VPN
+        s = Settings(self.tmp.name)
+        self.assertEqual(s.get("autostart_tunnel"), "")
+
 
 class TestTrayIcon(unittest.TestCase):
     def test_available(self):
@@ -124,6 +129,45 @@ class TestAutostart(unittest.TestCase):
     def test_app_name_is_ascii(self):
         # 注册表值名用中文在某些系统区域设置下会出怪问题
         self.assertTrue(autostart.APP_NAME.isascii())
+
+
+class TestAutostartBootFlag(unittest.TestCase):
+    """自启命令行要带 --boot，并且能原样拆回来。
+
+    拆错了会把「程序搬家」误判成「没设置过」，或者把参数当成路径的一部分，
+    所以解析单独测。这些函数都不碰注册表。
+    """
+
+    def test_parse_quoted_path_with_flag(self):
+        path, args = autostart.parse_command(
+            '"C:\\Program Files\\WireGuard管理台.exe" --boot')
+        self.assertEqual(path, "C:\\Program Files\\WireGuard管理台.exe")
+        self.assertEqual(args, [autostart.BOOT_FLAG])
+
+    def test_parse_legacy_plain_path(self):
+        # 老版本写的是纯路径，没有参数
+        path, args = autostart.parse_command("C:\\wg\\WireGuardManager.exe")
+        self.assertEqual(path, "C:\\wg\\WireGuardManager.exe")
+        self.assertEqual(args, [])
+
+    def test_parse_empty(self):
+        self.assertEqual(autostart.parse_command(""), ("", []))
+        self.assertEqual(autostart.parse_command(None), ("", []))
+
+    def test_is_boot_launch(self):
+        self.assertTrue(autostart.is_boot_launch(["--boot"]))
+        # 注册表被人手改成大写也要认
+        self.assertTrue(autostart.is_boot_launch(["--BOOT"]))
+        self.assertFalse(autostart.is_boot_launch([]))
+        self.assertFalse(autostart.is_boot_launch(None))
+        self.assertFalse(autostart.is_boot_launch(["--minimized"]))
+
+    def test_command_is_empty_in_source_mode(self):
+        # 源码模式没有可写的 exe，命令行必须是空串 —— 否则会写进 python.exe
+        self.assertEqual(autostart._command(), "")
+
+    def test_refresh_does_not_raise(self):
+        self.assertIsInstance(autostart.refresh(), bool)
 
 
 if __name__ == "__main__":
