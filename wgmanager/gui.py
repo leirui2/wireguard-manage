@@ -463,11 +463,23 @@ class App:
         self.traffic = TrafficStore(APP_DIR)
         # 本机组网的隧道配置仓库：和服务器配置分开存，删了服务器隧道还该留着
         self.tunnels = TunnelStore(APP_DIR)
+        # 隧道的明文 conf 要落在数据目录里长期保留 —— 服务命令行写死了这个路径，
+        # 每次开机都由 SCM 拉起服务重新读它。放 %TEMP% 里删掉的老做法会让
+        # 服务永远卡在 START_PENDING（详见 tunnel.conf_dir 的注释）。
+        try:
+            tunnel_mod.set_conf_dir(APP_DIR)
+        except Exception:
+            pass
         # 上一版把组网 conf 塞在服务器配置里，启动时挪进仓库
         self._migrate_tunnel_profiles()
         # 上次异常退出可能在 %TEMP% 留下明文 conf，启动时顺手扫一遍
         try:
             tunnel_mod.cleanup_stale()
+        except Exception:
+            pass
+        # 删隧道时如果服务还在跑，conf 会被刻意留着；等它断开后在这里收尾
+        try:
+            tunnel_mod.prune_confs(self.tunnels.names())
         except Exception:
             pass
         self._last_sample = 0.0
@@ -509,6 +521,15 @@ class App:
         try:
             if autostart_mod.refresh():
                 self._append_log("已更新开机自启的启动参数（升级后补齐）")
+        except Exception:
+            pass
+        # 被系统设成「以管理员身份运行」时，注册表自启会因错误 740 静默失败 ——
+        # 双击是 ShellExecute 会弹 UAC，平时看不出来，所以这里主动说一句
+        try:
+            if autostart_mod.forced_elevation():
+                self._append_log(
+                    "注意：本程序被 Windows 设成「以管理员身份运行」（exe 属性 → 兼容性），"
+                    "开机自启会因此失效。取消那个勾选就行，连隧道时的 UAC 提示不受影响。")
         except Exception:
             pass
         self._refresh_tree_widths()
@@ -2256,6 +2277,8 @@ class App:
                 break
         self._tunnel_buttons()
         self._show_tunnel_detail()
+        # 托盘菜单里的隧道勾选也一起更新：列表在这里重建，说明状态刚变过
+        self._refresh_tray_menu()
 
     def _insert_tunnel_row(self, name: str, summary: dict, note: str,
                            source: str) -> None:
@@ -2384,12 +2407,14 @@ class App:
             return
         self._start_tunnel(name, conf)
 
-    def _start_tunnel(self, name: str, conf: str, quiet: bool = False) -> None:
+    def _start_tunnel(self, name: str, conf: str, quiet: bool = False,
+                      notify_title: str = "开机自动连接") -> None:
         """在后台把一条隧道拉起来。
 
-        「连接」按钮和开机自连共用。``quiet=True``（开机自连用）时不弹模态
-        错误框：登录那一刻用户多半还没坐到电脑前，一个弹框只会挡着别的窗口，
-        结果照样进日志，托盘在跑的话再补一条气泡。
+        「连接」按钮、开机自连、托盘菜单共用。``quiet=True`` 时不弹模态错误框：
+        这两条路都不是"用户盯着界面等结果"的场景（登录那一刻人可能还没坐下，
+        托盘那条主窗口可能还藏着），弹框只会挡着别的窗口 —— 结果照样进日志，
+        托盘在跑的话再补一条气泡。
         """
         self.tun_status.configure(text=f"正在连接 {name} …")
 
@@ -2398,9 +2423,9 @@ class App:
                 try:
                     return tunnel_mod.start(name, conf, log=self._log)
                 except Exception as exc:  # noqa: BLE001 - 失败要变成日志，不能弹框
-                    self._log(f"开机自连隧道 {name} 失败：{exc}")
+                    self._log(f"连接隧道 {name} 失败：{exc}")
                     return tunnel_mod.TunnelResult(
-                        f"开机自连隧道 {name} 失败：{exc}", False)
+                        f"连接隧道 {name} 失败：{exc}", False)
             return tunnel_mod.start(name, conf, log=self._log)
 
         def done(result):
@@ -2413,9 +2438,10 @@ class App:
             note = getattr(result, "note", str(result))
             self._after_tunnel_action(note)
             if quiet and self.tray and self.tray.running:
-                self.tray.notify(note, "开机自动连接")
+                self.tray.notify(note, notify_title)
 
         self._async("连接组网隧道", work, done)
+
 
     def _boot_connect_tunnel(self) -> None:
         """开机自启那一次：把「设置」里指定的隧道自动连上。
@@ -2462,7 +2488,23 @@ class App:
             parent=self.root,
         ):
             return
+        self._stop_tunnel(name)
+
+    def _stop_tunnel(self, name: str, quiet: bool = False) -> None:
+        """在后台断开一条隧道（列表的「断开」和托盘菜单共用）。
+
+        ``quiet=True`` 时不弹模态错误框，原因同 ``_start_tunnel``。
+        """
         self.tun_status.configure(text=f"正在断开 {name} …")
+
+        def work():
+            if quiet:
+                try:
+                    return tunnel_mod.down(name, log=self._log)
+                except Exception as exc:  # noqa: BLE001 - 失败要变成日志，不能弹框
+                    self._log(f"断开隧道 {name} 失败：{exc}")
+                    return f"断开隧道 {name} 失败：{exc}"
+            return tunnel_mod.down(name, log=self._log)
 
         def done(msg):
             self._tunnels_up.discard(name)
@@ -2470,9 +2512,69 @@ class App:
             self._tun_prev.pop(name, None)
             self._tun_dump.pop(name, None)
             self._after_tunnel_action(msg)
+            if quiet and self.tray and self.tray.running:
+                self.tray.notify(msg, "托盘断开隧道")
 
-        self._async("断开组网隧道",
-                    lambda: tunnel_mod.down(name, log=self._log), done)
+        self._async("断开组网隧道", work, done)
+
+    # ------------------------------------------------------------ 托盘菜单
+    def _tray_tunnel_names(self) -> list:
+        """给托盘菜单用的隧道名快照。
+
+        这个回调在 pystray 的线程里跑，而增删隧道在主线程 —— 加一层兜底，
+        别让菜单构造因为一次竞态直接抛异常（那会让整个右键菜单出不来）。
+        """
+        try:
+            return list(self.tunnels.names())
+        except Exception:
+            return []
+
+    def _tray_tunnel_running(self, name: str) -> bool:
+        """托盘菜单的勾选状态：服务在跑就算连着。
+
+        只看服务状态、不探端口 —— 菜单展开要立刻出结果，等不得网络超时。
+        """
+        try:
+            return tunnel_mod.service_state(name) == "running"
+        except Exception:
+            return False
+
+    def _tray_toggle_tunnel(self, name: str) -> None:
+        """托盘菜单里点了某条隧道：连着就断，没连就连。
+
+        这里**不加确认框**：点具体哪一条本身就是明确意图，断的时候 Windows
+        还会弹一次 UAC，等于又确认了一遍。断错了重启一次也就几秒。
+        """
+        if not name:
+            return
+        if self.busy:
+            self._append_log("上一个操作还没结束，稍等一下再点托盘里的隧道。")
+            return
+        if name not in self.tunnels.names():
+            self._append_log(f"托盘：本工具里没有隧道 {name}，先在主窗口导入 .conf。")
+            self.show_window()
+            return
+        if self._tray_tunnel_running(name):
+            self._stop_tunnel(name, quiet=True)
+            return
+        conf = self.tunnels.get(name)
+        if not conf:
+            self._append_log(f"托盘：隧道 {name} 的配置解不开，重新导入一份即可。")
+            self.show_window()
+            return
+        if not tunnel_mod.available():
+            self._append_log("托盘：没检测到 WireGuard 客户端，组网用不了。")
+            return
+        self._start_tunnel(name, conf, quiet=True, notify_title="托盘连接隧道")
+
+    def _refresh_tray_menu(self) -> None:
+        """隧道状态变了就重建托盘菜单，让勾选对上实际状态。
+
+        只在动作结束后调：那时菜单已经关了，重建句柄不会和正弹出的菜单打架。
+        """
+        tray = self.tray
+        if tray is not None and tray.running:
+            tray.refresh_menu()
 
     def _delete_tunnel(self) -> None:
         _iid, name, source = self._selected_tunnel()
@@ -2487,6 +2589,13 @@ class App:
             return
         if self.tunnels.drop(name):
             self._append_log(f"已删除组网配置 {name}")
+            # 明文 conf 一并清掉。隧道还连着的时候先留着 —— 服务正读着它，
+            # 删了下次重启服务会起不来；这种情况交给启动时的 prune_confs 收尾。
+            try:
+                if tunnel_mod.service_state(name) != "running":
+                    tunnel_mod.drop_conf(name)
+            except Exception:
+                pass
         # 删掉的正好是「开机自动连接」选中的那条：顺手清空，别留个指不到的设置
         if str(self.settings.get("autostart_tunnel", "") or "").strip() == name:
             self.settings.set("autostart_tunnel", "")
@@ -2948,6 +3057,10 @@ class App:
                     on_show=self.show_window,
                     on_quit=self._really_quit,
                     on_check_update=self.check_update,
+                    # 右键菜单里直接列隧道：勾选=在跑，点一下连/断
+                    tunnel_names=self._tray_tunnel_names,
+                    tunnel_running=self._tray_tunnel_running,
+                    on_toggle_tunnel=self._tray_toggle_tunnel,
                 )
             if not self.tray.start():
                 self._append_log("托盘启动失败，关闭窗口将直接退出")
@@ -3996,6 +4109,16 @@ class SettingsDialog:
             self.auto_check.configure(state="disabled")
             ttk.Label(frame, text=reason, foreground="#8a8a8a", wraplength=520,
                       justify="left").pack(anchor="w", padx=(20, 0))
+
+        if autostart_mod.forced_elevation():
+            # 勾着这个开关却永远不生效，比不给勾更气人，所以直接摆明原因
+            ttk.Label(
+                frame,
+                text="注意：这个 exe 被设成了「以管理员身份运行」（exe 属性 → 兼容性），"
+                     "开机自启实际不会生效 —— 系统启动它时会以错误 740 拒绝。"
+                     "取消那个勾选即可；连隧道时的 UAC 提示不受影响。",
+                foreground="#b03030", wraplength=520, justify="left",
+            ).pack(anchor="w", padx=(20, 0), pady=(2, 0))
 
         # 开机那一次顺手连哪条隧道。选「不组网」就只开程序。
         boot_row = ttk.Frame(frame)

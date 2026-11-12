@@ -19,6 +19,9 @@ import sys
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_NAME = "WireGuardManager"
 
+#: 兼容性标记（exe 属性 → 兼容性 → "以管理员身份运行"）存在这里
+LAYERS_KEY = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+
 #: 开机自启专用的启动参数。用户双击 exe 时没有它。
 BOOT_FLAG = "--boot"
 
@@ -71,6 +74,42 @@ def is_boot_launch(argv) -> bool:
     参数比较不区分大小写：注册表被别人手改过的话可能是 ``--BOOT``。
     """
     return BOOT_FLAG in [str(arg).strip().lower() for arg in (argv or [])]
+
+
+def _layer_forced(value: str) -> bool:
+    """兼容性标记里是不是含 RUNASADMIN（"以管理员身份运行"）。"""
+    return "RUNASADMIN" in str(value or "").upper()
+
+
+def forced_elevation() -> bool:
+    """本程序有没有被 Windows 设成「以管理员身份运行」。
+
+    这个标记（exe 属性 → 兼容性）会让**用 CreateProcess 启动它直接失败**，
+    报错误 740 "请求的操作需要提升"：
+
+    * 注册表里的开机自启正是 CreateProcess 拉起来的 → 登录后什么都不发生，
+      而且**没有任何提示**，用户只会觉得"自启坏了"；
+    * 安装程序装完勾选"立即运行"也会弹同样的 740 错误框。
+
+    双击是 ShellExecute，会弹 UAC，所以平时看不出问题 —— 这也是它隐蔽的原因。
+    整个程序不需要管理员权限（只有建隧道那一刻要），所以有它就说明是误设。
+    """
+    if not available():
+        return False
+    path = _target_path()
+    if not path:
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, LAYERS_KEY) as key:
+            try:
+                value, _kind = winreg.QueryValueEx(key, path)
+            except FileNotFoundError:
+                return False
+    except OSError:
+        return False
+    return _layer_forced(value)
+
 
 
 def supported() -> tuple[bool, str]:

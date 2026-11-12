@@ -399,19 +399,55 @@ def _run(cmd: list[str], timeout: int) -> tuple[int, str]:
     return proc.returncode, out.strip()
 
 
-def _write_temp_conf(name: str, conf_text: str) -> str:
-    """把 conf 写到只有当前用户能进的临时目录，返回路径。
+#: 隧道明文 conf 的落盘根目录，由 GUI 启动时注入（``gui.APP_DIR``）。
+#:
+#: **为什么必须持久化**：``wireguard.exe /installtunnelservice <conf>`` 会把
+#: 这个路径原样写进服务的 ImagePath（``wireguard.exe /tunnelservice <conf>``），
+#: 服务每次启动都去重新读那个文件。早先的版本把 conf 放在
+#: ``%TEMP%\wgm-tunnel-xxxx`` 并在启动后删掉，结果是：
+#:
+#:   * 手动连一次能成（文件还在的那几十秒里服务已经把配置读进内存了）
+#:   * 但服务是 Auto 启动的，**开机时 SCM 拉起服务，文件早没了**
+#:     → 卡在 START_PENDING 不死不活 → 槽位被占，之后每次安装都失败
+#:
+#: 这不是"配置泄露风险 vs 方便"的取舍，而是 WireGuard 服务的硬性契约：
+#: 磁盘上必须有一份它能读到的 conf。官方客户端同样把配置放在
+#: ``Data\\Configurations\\*.conf.dpapi``（只是它自己用 DPAPI 加密，
+#: 而这条加密路径只对客户端内部开放）。我们能做的是把它放进
+#: 用户私有目录，靠 ``%LOCALAPPDATA%`` 的默认 ACL 限制读取范围。
+_CONF_DIR = ""
 
-    没有额外去改 ACL：``%TEMP%`` 默认就只给当前用户和 Administrators/SYSTEM，
-    已经够了；手动收紧反而会把自己后面的删除权限一起去掉（删不掉明文私钥
-    比留几秒钟更糟）。文件在隧道确认起来后立刻删，正常情况下存续几秒。
-    """
-    folder = tempfile.mkdtemp(prefix="wgm-tunnel-")
-    path = os.path.join(folder, name + ".conf")
+
+def set_conf_dir(path: str) -> None:
+    """注入数据目录（GUI 启动时调一次）。"""
+    global _CONF_DIR
+    _CONF_DIR = path
+
+
+def conf_dir(create: bool = True) -> str:
+    base = _CONF_DIR or os.path.join(
+        os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(), "WireGuard管理台")
+    folder = os.path.join(base, "tunnels")
+    if create:
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            pass
+    return folder
+
+
+def conf_path(name: str) -> str:
+    """某条隧道持久化 conf 的路径。文件名必须等于隧道名，客户端按它命名服务。"""
+    return os.path.join(conf_dir(), normalize_name(name) + ".conf")
+
+
+def _write_conf(path: str, conf_text: str) -> None:
     body = conf_text if conf_text.endswith("\n") else conf_text + "\n"
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write(body)
-    return path
+    os.replace(tmp, path)
 
 
 def _cleanup(path: str) -> None:
@@ -458,31 +494,83 @@ def cleanup_stale(max_age: float = 600) -> int:
     return removed
 
 
-def _shell_execute_runas(exe: str, params: str) -> int:
-    """显式用"以管理员身份运行"启动 exe，返回 ShellExecute 的结果码。
+def _shell_execute_runas(exe: str, params: str,
+                         timeout_ms: int = 120000) -> tuple[bool, int, int]:
+    """以管理员身份启动 exe 并等它跑完，返回 (是否发起, 错误码, 退出码)。
 
-    为什么不用 ``subprocess``：``wireguard.exe`` 装隧道服务必须先提权，它内部
-    虽然也会尝试自提权，但从一个非提权进程被 CreateProcess 起来时并不可靠 ——
-    实测会静默失败，我们连原因都拿不到。自己走 ``ShellExecuteW(runas)`` 后：
+    为什么不用 ``ShellExecuteW``：
 
-    * UAC 一定会弹（这是用户该看到的）
-    * 返回值能区分"用户取消了"（1223）和真的失败
-    * 返回值 > 32 只代表成功发起，进程是异步的，成败还得靠轮询服务状态
+    * 它只回一个 HINSTANCE，成败靠 ``<= 32`` 判断，而"用户点了否"返回的
+      **1223 是大于 32 的** —— 会被误判成"已经发起"，然后干等 90 秒，
+      日志里只反复刷"还在等你点「是」"，用户根本不知道发生了什么
+      （2026-11-12 用户报的"一直卡住"就是这么来的）。
+    * 拿不到子进程句柄，``wireguard.exe`` 到底返回了什么都看不到。
+
+    ``ShellExecuteExW`` + ``SEE_MASK_NOCLOSEPROCESS`` 两件事都能解决：
+    用户拒绝提权 → 函数直接返回 FALSE 且 last_error=1223；同意了 → 拿到
+    进程句柄，能等到它退出并读退出码。
     """
     import ctypes
+    from ctypes import wintypes
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        # 字段顺序必须与 shellapi.h 严格一致：x64 上 sizeof == 112
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("fMask", ctypes.c_ulong),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", wintypes.HKEY),
+            ("dwHotKey", wintypes.DWORD),
+            ("hIcon", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    SEE_MASK_NOCLOSEPROCESS = 0x00000040
+    SEE_MASK_FLAG_NO_UI = 0x00000400
 
     shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-    shell32.ShellExecuteW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
-                                      ctypes.c_wchar_p, ctypes.c_wchar_p,
-                                      ctypes.c_wchar_p, ctypes.c_int]
-    shell32.ShellExecuteW.restype = ctypes.c_void_p
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                            ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI
+    sei.lpVerb = "runas"
+    sei.lpFile = exe
+    sei.lpParameters = params
+    sei.lpDirectory = None
     # SW_HIDE：wireguard.exe 带开关运行时本来就不显示窗口，隐藏更稳妥
-    res = shell32.ShellExecuteW(None, "runas", exe, params, None, 0)
-    return int(res or 0)
+    sei.nShow = 0
 
+    ctypes.set_last_error(0)
+    if not shell32.ShellExecuteExW(ctypes.byref(sei)):
+        # UAC 被拒绝时这里就是 ERROR_CANCELLED(1223)，能准确报给用户
+        return False, ctypes.get_last_error(), 0
 
-#: ShellExecute 返回值小于等于这个数就是错误码，不是 HINSTANCE
-_SE_ERROR_LIMIT = 32
+    exit_code = 0
+    if sei.hProcess:
+        kernel32.WaitForSingleObject(sei.hProcess, timeout_ms)
+        code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(code)):
+            exit_code = int(code.value)
+        kernel32.CloseHandle(sei.hProcess)
+    return True, 0, exit_code
 
 
 def _elevate_error(code: int) -> str:
@@ -493,14 +581,15 @@ def _elevate_error(code: int) -> str:
         return "找不到 wireguard.exe，可能客户端被卸载了。"
     if code == 31:
         return "系统里没有可用的文件关联，无法启动 wireguard.exe。"
-    return f"启动 wireguard.exe 失败（ShellExecute 返回 {code}）。"
+    return f"启动 wireguard.exe 失败（系统错误码 {code}）。"
 
 
 def _launch(exe: str, args: list[str], log=print) -> str:
     """把一条 wireguard.exe 命令跑起来，需要时弹 UAC 提权。
 
-    已经提权就直接跑（能拿到输出，排查方便）；没提权就走 ShellExecute(runas)。
-    返回 wireguard.exe 的文本输出（提权路径下拿不到，返回空串）。
+    已经提权就直接跑（能拿到输出，排查方便）；没提权就走
+    ``ShellExecuteEx(runas)`` 并等它结束。返回 wireguard.exe 的文本输出
+    （提权路径下拿不到，返回空串）。
     """
     if is_admin():
         rc, out = _run([exe] + args, timeout=150)
@@ -508,15 +597,55 @@ def _launch(exe: str, args: list[str], log=print) -> str:
             log("wireguard.exe：" + " ".join(out.split())[:300])
         return out
     params = " ".join([args[0]] + [f'"{a}"' for a in args[1:]])
-    res = _shell_execute_runas(exe, params)
-    if res <= _SE_ERROR_LIMIT:
-        raise TunnelError(_elevate_error(res))
-    log("已请求管理员权限（UAC 弹窗请点「是」）")
+    ok, err, exit_code = _shell_execute_runas(exe, params)
+    if not ok:
+        raise TunnelError(_elevate_error(err))
+    if exit_code:
+        # 不在这里直接失败：某些版本成功时也会给非零码，成败仍以服务状态为准。
+        # 但把码打进日志，排查时不用再猜。
+        log(f"wireguard.exe 返回 {exit_code}")
+    else:
+        log("已请求管理员权限（UAC 弹窗请点「是」）")
     return ""
 
 
+def _remove_stale(name: str, exe: str, log=print) -> None:
+    """服务存在但没在跑 —— 这个残骸会让后面的 install 直接失败。
+
+    为什么必须显式清：``wireguard.exe /installtunnelservice`` 遇到同名服务时
+    会直接放弃，且不告诉我们原因，表现就是"配置没被收下"
+    （``Data\\Configurations`` 里没有它），特别容易误判成 UAC 被拒。
+
+    残骸是怎么来的：老版本把 conf 放在临时目录并在启动后删除，服务是 Auto
+    启动的，重启后读不到文件 → 永远停在 START_PENDING。这条路径现在已经
+    改成持久化 conf，但**已经在用户机器上卡住的服务得先清掉**。
+    """
+    state = service_state(name)
+    if state not in ("pending", "stopped"):
+        return
+    log(f"隧道 {name} 上次没退干净（当前：{STATE_CN.get(state, state)}），"
+        f"先把残留服务清掉再重建…")
+    _launch(exe, ["/uninstalltunnelservice", name], log)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if service_state(name) == "absent":
+            log(f"残留的隧道服务 {name} 已清理")
+            return
+        time.sleep(0.5)
+    raise TunnelError(
+        f"隧道 {name} 的服务卡在「{STATE_CN.get(state, state)}」清不掉。\n\n"
+        f"手动处理后重试：以管理员身份打开「服务」管理器，找到\n"
+        f"{service_name(name)}\n停止并删除它；或者直接重启一次电脑——"
+        f"重启后这个残骸一般会自己消失。"
+    )
+
+
 def install(name: str, conf_text: str, log=print) -> str:
-    """安装并启动隧道服务，返回临时 conf 路径 —— 调用方负责删。"""
+    """把隧道装成 Windows 服务，返回 conf 的持久路径。
+
+    注意 conf 是**长期保留**的，不再用临时目录：服务命令行里写死了这个路径，
+    每次开机都会重新读它。删隧道的才清（见 ``down``）。
+    """
     exe = client_path()
     if not exe:
         raise TunnelError(
@@ -525,12 +654,10 @@ def install(name: str, conf_text: str, log=print) -> str:
             "「下载客户端」里拿），装好后回来重试。"
         )
     name = normalize_name(name)
-    path = _write_temp_conf(name, conf_text)
-    try:
-        _launch(exe, ["/installtunnelservice", path], log)
-    except Exception:
-        _cleanup(path)
-        raise
+    path = conf_path(name)
+    _write_conf(path, conf_text)
+    _remove_stale(name, exe, log)
+    _launch(exe, ["/installtunnelservice", path], log)
     return path
 
 
@@ -546,6 +673,9 @@ def down(name: str, log=print) -> str:
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
         if service_state(name) == "absent":
+            # 服务没了，磁盘上那份明文 conf 也就没人读了，一并清掉。
+            # 下次连的时候 GUI 会从 tunnels.json 里的密文重新解出来写。
+            _cleanup(conf_path(name))
             log(f"组网隧道 {name} 已断开")
             return f"已断开组网隧道 {name}"
         time.sleep(0.5)
@@ -553,10 +683,56 @@ def down(name: str, log=print) -> str:
     raise TunnelError(f"卸载隧道 {name} 没有生效{detail}")
 
 
+def drop_conf(name: str) -> None:
+    """删掉某条隧道持久化的 conf。
+
+    只在隧道**没在跑**的时候调 —— 服务正在读这个文件，删了下次重启服务
+    就起不来了。
+    """
+    _cleanup(conf_path(name))
+
+
+def prune_confs(keep: list[str], log=print) -> int:
+    """清掉仓库里已经删掉的隧道留下的 conf（还在跑的服务不动）。
+
+    删配置时如果隧道正连着，conf 会被刻意保留（服务还在用）。等用户哪天
+    断开、或者重启后服务没了，这份明文就该清掉，不能一直躺在磁盘上。
+    """
+    folder = conf_dir(create=False)
+    if not os.path.isdir(folder):
+        return 0
+    keep_set = {normalize_name(n) for n in keep}
+    removed = 0
+    for entry in os.listdir(folder):
+        if not entry.endswith(".conf"):
+            continue
+        name = entry[:-5]
+        if name in keep_set:
+            continue
+        if service_state(name) == "running":
+            continue
+        try:
+            os.remove(os.path.join(folder, entry))
+            removed += 1
+        except OSError:
+            continue
+    if removed:
+        log(f"清理了 {removed} 份已删除隧道的配置文件")
+    return removed
+
+
 def _fail_hint(name: str) -> str:
-    """隧道没起来时给用户的诊断。靠"配置有没有被收下"分流排查方向。"""
+    """隧道没起来时给用户的诊断。先看服务是不是卡住了，再看配置有没有被收下。"""
     name = normalize_name(name)
     state = service_state(name)
+    if state in ("pending", "stopped"):
+        return (
+            f"隧道 {name} 的服务卡在「{STATE_CN.get(state, state)}」状态，起不来。\n\n"
+            "最常见的原因是**服务找不到配置文件**：服务命令行里写死了一个路径，"
+            "那个文件必须一直在。\n\n"
+            f"处理办法：重启一次电脑（卡住的服务会自己消失），"
+            f"或者以管理员身份在「服务」里手动删掉 {service_name(name)} 再重连。"
+        )
     if is_stored(name):
         return (
             f"WireGuard 客户端收下了配置，但隧道服务没起来"
@@ -595,27 +771,24 @@ def ensure_up(spec: TunnelSpec, wait: int = DEFAULT_WAIT,
             return TunnelResult(f"组网隧道 {name} 已在运行", False)
         return TunnelResult("目标地址已可直接连接，跳过组网", False)
 
-    path = ""
     started = False
-    try:
-        if service_state(name) == "running":
-            log(f"隧道 {name} 已在运行，等待 {spec.host}:{spec.port} 可达…")
-            total_wait = wait
-        else:
-            log(f"正在建立组网隧道 {name} …")
-            asked_uac = not is_admin()
-            if asked_uac:
-                log("即将弹出 Windows 权限确认，请点「是」，否则隧道建不起来。")
-            path = install(name, spec.conf, log)
-            started = True
-            # UAC 弹窗在用户手里，得给人留点击时间，不能按机器速度算超时
-            total_wait = max(wait, 90) if asked_uac else wait
+    if service_state(name) == "running":
+        log(f"隧道 {name} 已在运行，等待 {spec.host}:{spec.port} 可达…")
+        total_wait = wait
+    else:
+        log(f"正在建立组网隧道 {name} …")
+        asked_uac = not is_admin()
+        if asked_uac:
+            log("即将弹出 Windows 权限确认，请点「是」，否则隧道建不起来。")
+        # conf 落在数据目录里长期保留（服务每次开机都要重新读它），不能清理
+        install(name, spec.conf, log)
+        started = True
+        # UAC 弹窗在用户手里，得给人留点击时间，不能按机器速度算超时
+        total_wait = max(wait, 90) if asked_uac else wait
 
-        if wait_ready(spec.host, spec.port, name=name, timeout=total_wait, log=log):
-            return TunnelResult(
-                f"组网隧道 {name} 已连通（{spec.host}:{spec.port}）", started)
-    finally:
-        _cleanup(path)
+    if wait_ready(spec.host, spec.port, name=name, timeout=total_wait, log=log):
+        return TunnelResult(
+            f"组网隧道 {name} 已连通（{spec.host}:{spec.port}）", started)
 
     state = service_state(name)
     if state == "running":
@@ -647,25 +820,22 @@ def start(name: str, conf_text: str, wait: int = 20,
         )
     # 没提权时 UAC 弹窗在用户手里，等待时间要按人算而不是按机器算
     asked_uac = not is_admin()
-    path = ""
-    try:
-        log(f"正在建立隧道 {name} …")
-        if asked_uac:
-            log("即将弹出 Windows 权限确认，请点「是」，否则隧道建不起来。")
-        path = install(name, conf_text, log)
-        limit = max(5, wait, 90 if asked_uac else 0)
-        deadline = time.monotonic() + limit
-        last_note = 0.0
-        while time.monotonic() < deadline:
-            if service_state(name) == "running":
-                return TunnelResult(f"组网隧道 {name} 已连接", True)
-            now = time.monotonic()
-            if asked_uac and now - last_note > 12:
-                last_note = now
-                log("还在等你点「是」（权限确认没点的话隧道起不来）…")
-            time.sleep(0.5)
-    finally:
-        _cleanup(path)
+    log(f"正在建立隧道 {name} …")
+    if asked_uac:
+        log("即将弹出 Windows 权限确认，请点「是」，否则隧道建不起来。")
+    # conf 持久化在数据目录，服务每次开机都要重新读它，不能删
+    install(name, conf_text, log)
+    limit = max(5, wait, 90 if asked_uac else 0)
+    deadline = time.monotonic() + limit
+    last_note = 0.0
+    while time.monotonic() < deadline:
+        if service_state(name) == "running":
+            return TunnelResult(f"组网隧道 {name} 已连接", True)
+        now = time.monotonic()
+        if asked_uac and now - last_note > 12:
+            last_note = now
+            log("还在等你点「是」（权限确认没点的话隧道起不来）…")
+        time.sleep(0.5)
 
     raise TunnelError(_fail_hint(name))
 
