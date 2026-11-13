@@ -169,6 +169,68 @@ class TestAutostartBootFlag(unittest.TestCase):
     def test_refresh_does_not_raise(self):
         self.assertIsInstance(autostart.refresh(), bool)
 
+    def test_layer_flag_detection(self):
+        # 「以管理员身份运行」的兼容性标记会让 CreateProcess 直接 740 失败，
+        # 注册表自启因此静默失效 —— 认这个值要准
+        self.assertTrue(autostart._layer_forced("~ RUNASADMIN"))
+        self.assertTrue(autostart._layer_forced("RUNASADMIN HIGHDPIAWARE"))
+        self.assertFalse(autostart._layer_forced("HIGHDPIAWARE"))
+        self.assertFalse(autostart._layer_forced(""))
+        self.assertFalse(autostart._layer_forced(None))
+
+    def test_forced_elevation_does_not_raise(self):
+        self.assertIsInstance(autostart.forced_elevation(), bool)
+
+
+class TestTrayTunnelMenu(unittest.TestCase):
+    """托盘右键菜单里的「组网隧道」子菜单。
+
+    只测菜单描述对象（pystray 的 MenuItem 是纯对象，不需要屏幕）：
+    条目数、勾选状态、点击回调拿到的是不是隧道名。
+    """
+
+    def _items(self, names, running=(), clicked=None):
+        clicked = clicked if clicked is not None else []
+        return tray._tunnel_menu_items(
+            names, lambda n: n in running, clicked.append)
+
+    def test_empty_repo_shows_hint_instead(self):
+        items = self._items([])
+        self.assertEqual(len(items), 1)
+        self.assertIn("还没有导入隧道", items[0].text)
+        self.assertFalse(items[0].enabled, "空仓库时不该给出可点条目")
+
+    def test_one_entry_per_tunnel(self):
+        labels = [i.text for i in self._items(["wgm-a", "wgm-b"], {"wgm-a"})]
+        self.assertIn("wgm-a", labels)
+        self.assertIn("wgm-b", labels)
+
+    def test_checkbox_matches_running_state(self):
+        by_text = {i.text: i for i in self._items(["wgm-a", "wgm-b"],
+                                                  {"wgm-b"})}
+        self.assertFalse(by_text["wgm-a"].checked)
+        self.assertTrue(by_text["wgm-b"].checked)
+
+    def test_click_receives_tunnel_name(self):
+        # 这里踩过一次：带默认值的 lambda 被 pystray 当成"接收 icon"，
+        # 结果隧道名变成了 Icon 对象。传 None 当 icon 能把这种错暴露出来
+        clicked = []
+        item = {i.text: i for i in self._items(["wgm-a"], clicked=clicked)}["wgm-a"]
+        item(None)
+        self.assertEqual(clicked, ["wgm-a"])
+
+    def test_state_probe_failure_counts_as_stopped(self):
+        def boom(_name):
+            raise RuntimeError("服务查询炸了")
+
+        items = tray._tunnel_menu_items(["wgm-a"], boom, lambda _n: None)
+        entry = {i.text: i for i in items}["wgm-a"]
+        self.assertFalse(entry.checked)
+
+    def test_has_manual_refresh_entry(self):
+        # 勾选是构造菜单时的快照，外部改了状态得靠它（点任意项都会重建）
+        self.assertIn("刷新状态", [i.text for i in self._items(["wgm-a"])])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -246,11 +246,14 @@ def mono_font(delta: int = 0):
 
 
 def center_window(win, width: int | None = None, height: int | None = None,
-                  parent=None) -> None:
+                  parent=None, show: bool = True) -> None:
     """把窗口摆到屏幕正中。
 
     先 withdraw 再定位、最后 deiconify，避免窗口先在左上角闪一下再跳过去。
     多显示器横向排列时，以父窗口所在的那块屏幕为基准。
+
+    ``show=False`` 只摆位置、不上屏 —— 开机自启那一次要的就是"窗口按正常
+    尺寸放在那儿，但先别弹出来"，等用户从托盘点「显示主窗口」再出来。
     """
     win.withdraw()
     win.update_idletasks()
@@ -268,6 +271,8 @@ def center_window(win, width: int | None = None, height: int | None = None,
     x = screen_left + max(0, (sw - w) // 2)
     y = max(0, (sh - h) // 2)
     win.geometry(f"{w}x{h}+{x}+{y}")
+    if not show:
+        return
     win.deiconify()
     win.lift()
     try:
@@ -556,8 +561,27 @@ class App:
         # 表格只请求 6 行，光按 req 算窗口会偏矮；给个下限，
         # 剩下的高度由表格自己撑开
         height = min(max(960, self.root.winfo_reqheight() + 12), int(sh * 0.90))
-        center_window(self.root, width, height)
+        # 开机自启那一次：位置和尺寸照常算好，但**不上屏**，只留托盘图标。
+        # 位置先摆好，用户从托盘点「显示主窗口」时就不会闪一下再跳。
+        hidden = self._start_hidden()
+        center_window(self.root, width, height, show=not hidden)
+        if hidden:
+            self._append_log("开机自启：只在托盘留一个图标，窗口不弹出来"
+                             "（托盘右键 → 显示主窗口 可以打开，"
+                             "「组网隧道」子菜单能直接连/断）。")
         self._check_pending_update()
+
+    def _start_hidden(self) -> bool:
+        """开机自启那一次要不要藏起窗口。
+
+        只有"被系统拉起来 + 托盘确实能用"才藏：托盘不可用时藏起来等于把程序
+        关进小黑屋 —— 没有窗口也没有图标，任务管理器之外没有任何入口。
+        """
+        if not self.boot_launch:
+            return False
+        if not self.settings.get("tray_enabled", True) or not tray_mod.available():
+            return False
+        return True
 
     def _check_pending_update(self) -> None:
         """上次替换失败会留下 update-error.txt，启动时提醒一句，别让人以为更新成功了。"""
@@ -3038,12 +3062,23 @@ class App:
 
     def _start_tray_if_enabled(self) -> None:
         """启动后延迟开托盘：先让主窗口出来，别让托盘抢在前面。"""
+        self._tray_job = None
         try:
             if not self.root.winfo_exists():
                 return
         except Exception:
             return
         self._apply_tray(True)
+        # 兜底：开机自启时窗口是藏着的，托盘要是没起来就真没入口了。
+        # 宁可把窗口弹出来（用户顶多觉得"说好的后台呢"），也不能让程序失联。
+        if self.tray is None or not self.tray.running:
+            try:
+                if self.root.state() == "withdrawn":
+                    self._append_log("托盘没能启动，已把主窗口显示出来"
+                                     "（否则程序就没有入口了）。")
+                    self.show_window()
+            except Exception:
+                pass
 
     def _apply_tray(self, enable: bool) -> None:
         if enable:
@@ -4097,7 +4132,7 @@ class SettingsDialog:
         ok, reason = autostart_mod.supported()
         self.auto_var = tk.BooleanVar(value=autostart_mod.is_enabled())
         self.auto_check = ttk.Checkbutton(
-            frame, text="开机自动启动（登录 Windows 后自动打开并缩到托盘）",
+            frame, text="开机自动启动（登录 Windows 后只在托盘里出现，不弹窗口）",
             variable=self.auto_var, command=self._on_autostart)
         self.auto_check.pack(anchor="w")
         if ok:
@@ -4290,11 +4325,12 @@ class SettingsDialog:
                      "隧道要靠管理员权限建立，登录后会弹一次权限确认，请点「是」。",
                 foreground="#a05000")
             return
-        head = (f"登录 Windows 后会自动打开程序并连上 {name}。" if name
-                else "登录 Windows 后只打开程序，不组网。")
+        head = (f"登录后在托盘里启动，并连上 {name}（不弹窗口）。" if name
+                else "登录后只在托盘里启动，不组网（不弹窗口）。")
         self.boot_hint.configure(
             text=head + "隧道要靠管理员权限建立，会弹一次权限确认，请点「是」，"
-                        "否则连不上。\n手动双击打开程序不会自动连。只列本工具导入的隧道 —— "
+                        "否则连不上。\n想打开界面就右键托盘图标 → 显示主窗口。"
+                        "手动双击打开程序不会自动连。只列本工具导入的隧道 —— "
                         "客户端自己建的那些拿不到配置，起不了。",
             foreground="#8a8a8a")
 

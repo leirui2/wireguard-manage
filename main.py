@@ -37,10 +37,18 @@ def _close_splash() -> None:
 
 
 def main() -> None:
+    # 开机自启是纯后台启动（窗口不弹、只留托盘图标），没人盯着看启动图，
+    # 所以早点收掉；手动双击时保留它，单文件版解压要几秒，有反馈才不像卡死。
+    from wgmanager.autostart import is_boot_launch
+
+    if is_boot_launch(sys.argv[1:]):
+        _close_splash()
+
     from wgmanager.gui import App
 
     app = App()
-    # 走到这里主窗口已经显示（App.__init__ 末尾会 deiconify），启动图可以退了
+    # 走到这里窗口已经摆好（正常启动是显示出来，--boot 时是藏进托盘），
+    # 启动图可以退了 —— 开机自启那次上面已经提前关过，重复调用无害
     _close_splash()
     app.run()
 
