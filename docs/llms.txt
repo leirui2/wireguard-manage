@@ -23,6 +23,11 @@
 - 校验值：
   https://github.com/leirui2/wireguard-manage/releases/latest/download/SHA256.txt
 - 下载链接永久固定（`releases/latest/download/...`），每次推送到 main 自动重新打包并覆盖同名资产。
+- 国内镜像（Gitee，同一份文件，SHA256 一致，链接永久固定）：
+  https://gitee.com/leirui0421/wireguard-manage/releases/download/latest/WireGuardManager-setup.exe
+  https://gitee.com/leirui0421/wireguard-manage/releases/download/latest/WireGuardManager.exe
+- 源码仓库：GitHub https://github.com/leirui2/wireguard-manage
+  ；Gitee 镜像 https://gitee.com/leirui0421/wireguard-manage
 
 ## 核心能力
 

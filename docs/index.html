@@ -287,6 +287,9 @@ wg-quick strip + wg syncconf 热加载（不中断现有连接）
     </p>
     <p>两种发行版功能完全相同，下载链接永久固定（<code>releases/latest/download/...</code>）。安装版装完启动约 1 秒；单文件版首次启动约 5 秒（要把 49 MB 运行库解压到 <code>%TEMP%</code>），换来的是免安装和程序内自动更新。</p>
     <p>校验值：<a href="https://github.com/leirui2/wireguard-manage/releases/latest/download/SHA256.txt">SHA256.txt</a>（与 exe 同目录）。</p>
+    <p><strong>国内网络下载慢？</strong>同一份文件已同步到 Gitee，速度更快，链接同样永久固定：
+      <a href="https://gitee.com/leirui0421/wireguard-manage/releases/download/latest/WireGuardManager-setup.exe">Gitee 安装版</a> /
+      <a href="https://gitee.com/leirui0421/wireguard-manage/releases/download/latest/WireGuardManager.exe">Gitee 单文件版</a>（SHA256 与 GitHub 完全一致）。</p>
     <div class="note"><strong>没有代码签名</strong>：Windows SmartScreen 会提示「未知发布者」，选「更多信息 → 仍要运行」。这是本项目当前最大的已知限制。</div>
   </div>
 </section>

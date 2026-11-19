@@ -129,6 +129,10 @@ wg-quick strip + wg syncconf 热加载（不中断现有连接）
 | `WireGuardManager.exe` | PyInstaller 单文件，约 21.4 MB | 免安装；每次启动解压 49 MB / 1028 个文件到 `%TEMP%\_MEIxxxx`，实测 2.4 秒，加冻结加载与杀软扫描约 5 秒；支持程序内自动更新 |
 
 - 下载链接永久固定：`https://github.com/leirui2/wireguard-manage/releases/latest/download/<资产名>`
+- 国内镜像（Gitee，同一份文件、SHA256 一致、链接永久固定）：
+  `https://gitee.com/leirui0421/wireguard-manage/releases/download/latest/<资产名>`
+- 源码双托管：GitHub `https://github.com/leirui2/wireguard-manage` ；
+  Gitee 镜像 `https://gitee.com/leirui0421/wireguard-manage`（国内访问更快）
 - 推送到 `main` → 更新滚动发行版 `latest`（同名资产覆盖）；推送 `v1.0.0` 标签 → 新建正式版本
 - 更新三条底线：只从 `github.com` / `objects.githubusercontent.com` 下载；必须核对 `SHA256.txt`；新包先落 `updates\`，不直接动正在用的 exe
 - 目录版（portable）不支持自动替换（`_internal\` 的 DLL 运行期被占用）

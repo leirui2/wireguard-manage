@@ -25,6 +25,16 @@ SHA256 校验值见同一发行版下的 [SHA256.txt](https://github.com/leirui2
 > Windows 10 / 11 64 位，双击即用，**不需要安装 Python 或任何运行库**。
 > 也可以到 [Releases 页面](https://github.com/leirui2/wireguard-manage/releases) 查看历史版本。
 
+**国内网络下载慢？** 同一份文件已同步到 Gitee，速度更快，链接同样永久固定：
+
+| 版本 | Gitee 下载（国内推荐） |
+|---|---|
+| 安装版 | **[WireGuardManager-setup.exe](https://gitee.com/leirui0421/wireguard-manage/releases/download/latest/WireGuardManager-setup.exe)** |
+| 单文件版 | **[WireGuardManager.exe](https://gitee.com/leirui0421/wireguard-manage/releases/download/latest/WireGuardManager.exe)** |
+
+> Gitee 上的版本按发布节奏同步，可能比 GitHub 略滞后一版；两个站的文件 SHA256 完全一致，可交叉校验。
+> Gitee 仓库地址：<https://gitee.com/leirui0421/wireguard-manage>
+
 ---
 
 ## 它和其他 WireGuard 管理方案的区别
