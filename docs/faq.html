@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>常见问题 — WireGuard 管理台（WireGuardManager）</title>
+<meta name="description" content="WireGuard 管理台（WireGuardManager）常见问题：Windows 上有没有 WireGuard 图形化管理工具、不想装 wg-easy 怎么办、加 peer 要不要重启、私钥会不会上传、客户端连不上怎么排查。">
+<link rel="canonical" href="https://leirui2.github.io/wireguard-manage/faq.html">
+<meta property="og:type" content="article">
+<meta property="og:title" content="常见问题 — WireGuard 管理台（WireGuardManager）">
+<meta property="og:description" content="12 个真实使用问题的自足答案。">
+<meta property="og:url" content="https://leirui2.github.io/wireguard-manage/faq.html">
+<meta property="og:image" content="https://leirui2.github.io/wireguard-manage/assets/main-ui.png">
+<link rel="icon" href="assets/favicon.ico" type="image/x-icon">
+<style>
+:root{--fg:#1b1f24;--muted:#57606a;--bg:#fff;--soft:#f6f8fa;--line:#d0d7de;--blue:#0969da;--green:#1a7f37}
+*{box-sizing:border-box}
+body{margin:0;font:16px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:var(--fg);background:var(--bg)}
+.wrap{max-width:860px;margin:0 auto;padding:0 20px}
+header{padding:38px 0 24px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#f6f8fa,#fff)}
+h1{margin:0 0 8px;font-size:30px;letter-spacing:-.02em}
+.sub{color:var(--muted);margin:0 0 14px}
+a{color:var(--blue)}
+code{background:var(--soft);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:13.5px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+pre{background:var(--soft);border:1px solid var:0;border:1px solid var(--line);border-radius:8px;padding:13px 16px;overflow:auto}
+table{width:100%;border-collapse:collapse;margin:0 0 14px;font-size:14.5px}
+th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+th{background:var(--soft)}
+section{padding:26px 0;border-bottom:1px solid var(--line)}
+h2{font-size:22px;margin:0 0 6px}
+h3{font-size:18px;margin:24px 0 8px;padding-top:4px}
+h3 .q{color:var(--fg)}
+p{margin:0 0 12px}
+ul,ol{padding-left:22px}
+li{margin:5px 0}
+.answer{border-left:3px solid var(--green);padding-left:14px;margin:0 0 8px}
+.answer p:last-child{margin-bottom:0}
+figure{margin:12px 0 0}
+figcaption{color:var(--muted);font-size:13.5px;margin-top:6px}
+img.shot{max-width:100%;border:1px solid var(--line);border-radius:8px}
+footer{padding:24px 0 44px;color:var(--muted);font-size:14px}
+.toc{background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:16px 20px}
+.toc ol{margin:6px 0 0}
+</style>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    { "@type": "Question", "name": "Windows 上有没有 WireGuard 图形化管理工具，能批量给服务器加 peer？",
+      "acceptedAnswer": { "@type": "Answer", "text": "有。WireGuard 管理台（WireGuardManager）是一个 Windows 桌面版 WireGuard 管理工具，通过 SSH 直接管理服务器上 wg0.conf 里的 peer，支持查看、新增、修改、删除；新增时自动分配空闲 IPv4/IPv6 地址，地址冲突会被拒绝。生成的客户端配置可以出二维码，手机 WireGuard App 扫码直接导入。它不需要在服务器部署 Web 面板、Docker 或数据库，直接操作你已有的标准 wg-quick 配置。" } },
+    { "@type": "Question", "name": "不想在服务器装 wg-easy 或 Docker，有没有直接改 wg0.conf 的工具？",
+      "acceptedAnswer": { "@type": "Answer", "text": "有。WireGuard 管理台（WireGuardManager）就是这种工具：它是一个 Windows 桌面程序，用 SSH 连上服务器，直接读写 /etc/wireguard/wg0.conf，服务器上不需要装任何 Web 面板、Docker、数据库或额外守护进程，服务端保持标准 wg-quick 部署不变。注意：新版 wg-easy 把 peer 存在数据库里，这种情况下直接改文件未必生效。" } },
+    { "@type": "Question", "name": "给同事发 WireGuard 配置太麻烦，有扫码导入的办法吗？",
+      "acceptedAnswer": { "@type": "Answer", "text": "有。生成密钥后点「二维码」，工具把完整客户端 .conf 编码成二维码，手机 WireGuard App 用「扫描二维码」直接导入，不需要手抄或传输文本文件；也可以「保存为 PNG」用图片形式发。码里含客户端私钥，属于凭据本身，不要贴到公开场合。" } },
+    { "@type": "Question", "name": "用 WireGuard 管理台加 peer 要重启服务或中断连接吗？",
+      "acceptedAnswer": { "@type": "Answer", "text": "不需要。流程是 备份 wg0.conf → 写临时文件 → cp+mv 原子替换 → wg-quick strip + wg syncconf 热加载 → 回读文件校验 + 运行时公钥核对，已有连接不会断。任何一步失败会自动恢复备份并重新加载，不会留下半截配置。" } },
+    { "@type": "Question", "name": "WireGuard 服务端没装，能用图形界面一键装吗？",
+      "acceptedAnswer": { "@type": "Answer", "text": "能。连接后探测到服务器没有 WireGuard，工具会弹出安装方案让你确认网段、UDP 端口、出口网卡和 NAT 选项，然后按 /etc/os-release 判定发行版，用 apt / dnf / pacman / zypper 自动装包，写入标准 wg-quick 配置、开 IP 转发、systemctl 启用并启动，最后回读公钥校验。支持 Ubuntu/Debian 系、RHEL 8/9 系、Arch 系、openSUSE；Debian 10 及更早、CentOS 7、非 systemd 系统会明确拒绝并给出手动命令。" } },
+    { "@type": "Question", "name": "WireGuard 管理台和官方 WireGuard 客户端有什么区别？",
+      "acceptedAnswer": { "@type": "Answer", "text": "官方客户端只负责连接一条隧道，不管理服务器的 peer。本工具的「本机组网」页同样能导入 .conf、连接/断开、看状态和实时速率；但核心价值在「密钥管理」页：通过 SSH 图形化增删改服务器 wg0.conf 里的 peer，并附带一键装服务端。所以两者不是替代关系：隧道本身仍由官方客户端托管，本工具只是把它自动化。" } },
+    { "@type": "Question", "name": "这工具安全吗？客户端私钥会不会上传到服务器或上传到作者那里？",
+      "acceptedAnswer": { "@type": "Answer", "text": "客户端私钥只在你本机生成，服务端只保存公钥，私钥从不离开本机。SSH 密码与隧道配置用 Windows DPAPI 加密存储，known_hosts 用 TOFU 记录主机指纹防止中间人，日志中 PrivateKey/PresharedKey/password 一律替换为 ***。工具本身不联网、不上报任何数据，只在你点「连接」时通过 SSH 直连你的服务器。" } },
+    { "@type": "Question", "name": "连接时报「没有找到 WireGuard 配置文件」怎么办？",
+      "acceptedAnswer": { "@type": "Answer", "text": "先看权限。/etc/wireguard 通常是 700 root，普通用户读不到。在连接区填「sudo 密码」，或改用 root 登录；工具会把「无 sudo 权限 / 权限被拒 / 目录不存在」分开提示。配置不在默认位置时，可在「高级设置」里手动指定配置文件绝对路径和接口名。" } },
+    { "@type": "Question", "name": "新增密钥后客户端连不上，怎么排查？",
+      "acceptedAnswer": { "@type": "Answer", "text": "查三件事：① 客户端 .conf 里的 Endpoint 是公网可达的地址和端口；② 服务器防火墙放行了 UDP 监听端口；③ 云厂商安全组同样要放行 UDP。改过 VPN 地址后客户端 Address 没同步也会连不上，用工具生成的客户端配置时会主动提示一并修改。" } },
+    { "@type": "Question", "name": "wg-easy / Docker 部署能用这个工具吗？",
+      "acceptedAnswer": { "@type": "Answer", "text": "会尝试 docker exec 进容器读写，但新版 wg-easy 用数据库管理客户端，直接改文件可能不生效。请先在测试环境验证，或改用「手动指定配置路径」。" } },
+    { "@type": "Question", "name": "exe 被杀毒软件拦截 / 首次启动慢怎么办？",
+      "acceptedAnswer": { "@type": "Answer", "text": "PyInstaller 打包的程序没有代码签名，容易被误报，添加信任即可；介意可以自行用源码运行。单文件模式每次启动要把 49 MB 运行库解压到 %TEMP%，约 2~4 秒，加上杀软扫描合计约 5 秒；想要秒开请用安装版（安装版实测 0.9 秒）。" } },
+    { "@type": "Question", "name": "这个工具需要服务器上装额外东西吗？",
+      "acceptedAnswer": { "@type": "Answer", "text": "不需要。服务器只要有可用的 WireGuard（标准 wg-quick 部署即可，用内置一键装也能搞定）和 SSH 访问权限，工具通过 SSH 直接操作配置文件。服务端不需要 Web 面板、Docker、数据库或任何常驻进程。唯一前提是读取 /etc/wireguard 需要 root 或可用的 sudo。" } }
+  ]
+}
+</script>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>常见问题</h1>
+    <p class="sub">WireGuard 管理台（WireGuardManager）—— 12 个真实使用问题的自足答案。</p>
+    <p><a href="index.html">← 返回首页</a> ｜ <a href="llms.txt">llms.txt</a> ｜ <a href="https://github.com/leirui2/wireguard-manage">源码仓库</a></p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <div class="toc">
+      <strong>目录</strong>
+      <ol>
+        <li><a href="#q1">Windows 上有没有 WireGuard 图形化管理工具</a></li>
+        <li><a href="#q2">不想装 wg-easy，有没有直接改 wg0.conf 的工具</a></li>
+        <li><a href="#q3">给同事发配置太麻烦，有扫码的办法吗</a></li>
+        <li><a href="#q4">加 peer 要重启服务或断线吗</a></li>
+        <li><a href="#q5">服务端没装 WireGuard，能一键装吗</a></li>
+        <li><a href="#q6">和官方 WireGuard 客户端有什么区别</a></li>
+        <li><a href="#q7">安全吗？私钥会不会上传</a></li>
+        <li><a href="#q8">连接时报「没有找到 WireGuard 配置文件」</a></li>
+        <li><a href="#q9">新增密钥后客户端连不上</a></li>
+        <li><a href="#q10">wg-easy / Docker 部署能用吗</a></li>
+        <li><a href="#q11">exe 被杀软拦截 / 首次启动慢</a></li>
+        <li><a href="#q12">服务器需要装额外东西吗</a></li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<section id="q1">
+  <div class="wrap">
+    <h3><span class="q">Q：Windows 上有没有 WireGuard 图形化管理工具，能批量给服务器加 peer？</span></h3>
+    <div class="answer">
+      <p>有。WireGuard 管理台（WireGuardManager）是一个 Windows 桌面版 WireGuard 管理工具，通过 SSH 直接管理服务器上 <code>wg0.conf</code> 里的 peer，支持查看、新增、修改、删除；新增时自动分配空闲 IPv4/IPv6 地址，地址冲突会被拒绝。</p>
+      <p>生成的客户端配置可以出二维码，手机 WireGuard App 扫码直接导入。它不需要在服务器部署 Web 面板、Docker 或数据库，直接操作你已有的标准 <code>wg-quick</code> 配置。</p>
+    </div>
+    <p><a class="btn" href="https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager-setup.exe">⬇ 安装版下载</a></p>
+  </div>
+</section>
+
+<section id="q2">
+  <div class="wrap">
+    <h3><span class="q">Q：不想在服务器装 wg-easy 或 Docker，有没有直接改 wg0.conf 的工具？</span></h3>
+    <div class="answer">
+      <p>有。WireGuard 管理台（WireGuardManager）就是这种工具：它是一个 Windows 桌面程序，用 SSH 连上服务器，直接读写 <code>/etc/wireguard/wg0.conf</code>，服务器上不需要装任何 Web 面板、Docker、数据库或额外守护进程，服务端保持标准 <code>wg-quick</code> 部署不变。</p>
+      <p>注意：新版 wg-easy 把 peer 存在数据库里，这种情况下直接改文件未必生效。</p>
+    </div>
+  </div>
+</section>
+
+<section id="q3">
+  <div class="wrap">
+    <h3><span class="q">Q：给同事发 WireGuard 配置太麻烦，有扫码导入的办法吗？</span></h3>
+    <div class="answer">
+      <p>有。生成密钥后点「二维码」，工具把完整客户端 <code>.conf</code> 编码成二维码，手机 WireGuard App 用「扫描二维码」直接导入，不需要手抄或传输文本文件；也可以「保存为 PNG」用图片形式发。</p>
+      <p>码里含客户端私钥，属于凭据本身，扫完别把它贴到公开的地方。</p>
+    </div>
+    <figure>
+      <img class="shot" src="assets/qr-dialog.png" alt="客户端配置二维码对话框" width="497" height="613" loading="lazy" style="max-width:400px">
+      <figcaption>客户端配置二维码对话框</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="q4">
+  <div class="wrap">
+    <h3><span class="q">Q：用 WireGuard 管理台加 peer 要重启服务或中断连接吗？</span></h3>
+    <div class="answer">
+      <p>不需要。流程是 <strong>备份 → 写临时文件 → cp+mv 原子替换 → wg-quick strip + wg syncconf 热加载 → 回读文件校验 + 运行时公钥核对</strong>，已有连接不会断。</p>
+      <p>任何一步失败会自动恢复备份并重新加载，不会留下半截配置。</p>
+    </div>
+  </div>
+</section>
+
+<section id="q5">
+  <div class="wrap">
+    <h3><span class="q">Q：WireGuard 服务端没装，能用图形界面一键装吗？</span></h3>
+    <div class="answer">
+      <p>能。连接后探测到服务器没有 WireGuard，工具会弹出安装方案让你确认网段、UDP 端口、出口网卡和 NAT 选项，然后按 <code>/etc/os-release</code> 判定发行版，用 <code>apt</code> / <code>dnf</code> / <code>pacman</code> / <code>zypper</code> 自动装包，写入标准 <code>wg-quick</code> 配置、开 IP 转发、<code>systemctl</code> 启用并启动，最后回读公钥校验。</p>
+      <p>支持 Ubuntu/Debian 系、RHEL 8/9 系、Arch 系、openSUSE；<strong>Debian 10 及更早、CentOS 7、非 systemd 系统会明确拒绝</strong>并给出手动命令。</p>
+    </div>
+    <figure>
+      <img class="shot" src="assets/install-dialog.png" alt="一键安装服务端对话框" width="618" height="610" loading="lazy" style="max-width:480px">
+      <figcaption>一键安装服务端：执行前先把每条命令列出来</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="q6">
+  <div class="wrap">
+    <h3><span class="q">Q：WireGuard 管理台和官方 WireGuard 客户端有什么区别？</span></h3>
+    <div class="answer">
+      <p>官方客户端只负责连接一条隧道，不管理服务器的 peer。本工具的「本机组网」页同样能导入 <code>.conf</code>、连接/断开、看状态和实时速率；但核心价值在「密钥管理」页：通过 SSH 图形化增删改服务器 <code>wg0.conf</code> 里的 peer，并附带一键装服务端。</p>
+      <p>所以两者不是替代关系：隧道本身仍由官方客户端托管，本工具只是把它自动化。</p>
+    </div>
+  </div>
+</section>
+
+<section id="q7">
+  <div class="wrap">
+    <h3><span class="q">Q：这工具安全吗？客户端私钥会不会上传到服务器或上传到作者那里？</span></h3>
+    <div class="answer">
+      <p>客户端私钥只在你本机生成，服务端只保存公钥，<strong>私钥从不离开本机</strong>。SSH 密码与隧道配置用 Windows DPAPI 加密存储，<code>known_hosts</code> 用 TOFU 记录主机指纹防止中间人，日志中 <code>PrivateKey</code> / <code>PresharedKey</code> / <code>password</code> 一律替换为 <code>***</code>。</p>
+      <p>工具本身不联网、不上报任何数据，只在你点「连接」时通过 SSH 直连你的服务器。</p>
+    </div>
+  </div>
+</section>
+
+<section id="q8">
+  <div class="wrap">
+    <h3><span class="q">Q：连接时报「没有找到 WireGuard 配置文件」怎么办？</span></h3>
+    <div class="answer">
+      <p>先看权限。<code>/etc/wireguard</code> 通常是 <code>700 root</code>，普通用户读不到。在连接区填「sudo 密码」，或改用 <code>root</code> 登录；工具会把「无 sudo 权限 / 权限被拒 / 目录不存在」分开提示。</p>
+      <p>配置不在默认位置时，可在「高级设置」里手动指定配置文件绝对路径和接口名。</p>
+    </div>
+  </div>
+</section>
+
+<section id="q9">
+  <div class="wrap">
+    <h3><span class="q">Q：新增密钥后客户端连不上，怎么排查？</span></h3>
+    <div class="answer">
+      <p>查三件事：① 客户端 <code>.conf</code> 里的 <code>Endpoint</code> 是公网可达的地址和端口；② 服务器防火墙放行了 <strong>UDP</strong> 监听端口；③ 云厂商安全组同样要放行 UDP。</p>
+      <p>改过 VPN 地址后客户端 <code>Address</code> 没同步也会连不上，用工具生成的客户端配置时会主动提示一并修改。</p>
+    </div>
+  </div>
+</section>
+
+<section id="q10">
+  <div class="wrap">
+    <h3><span class="q">Q：wg-easy / Docker 部署能用这个工具吗？</span></h3>
+    <div class="answer">
+      <p>会尝试 <code>docker exec</code> 进容器读写，但新版 wg-easy 用数据库管理客户端，直接改文件可能不生效。请先在测试环境验证，或改用「手动指定配置路径」。</p>
+    </div>
+  </div>
+</section>
+
+<section id="q11">
+  <div class="wrap">
+    <h3><span class="q">Q：exe 被杀毒软件拦截 / 首次启动慢怎么办？</span></h3>
+    <div class="answer">
+      <p>PyInstaller 打包的程序没有代码签名，容易被误报，添加信任即可；介意可以自行用源码运行。单文件模式每次启动要把 49 MB 运行库解压到 <code>%TEMP%</code>，约 2~4 秒，加上杀软扫描合计约 5 秒；想要秒开请用 <strong>安装版</strong>（安装版实测 0.9 秒）。</p>
+    </div>
+  </div>
+</section>
+
+<section id="q12">
+  <div class="wrap">
+    <h3><span class="q">Q：这个工具需要服务器上装额外东西吗？</span></h3>
+    <div class="answer">
+      <p>不需要。服务器只要有可用的 WireGuard（标准 <code>wg-quick</code> 部署即可，用内置一键装也能搞定）和 SSH 访问权限，工具通过 SSH 直接操作配置文件。服务端不需要 Web 面板、Docker、数据库或任何常驻进程。</p>
+      <p>唯一前提是读取 <code>/etc/wireguard</code> 需要 root 或可用的 sudo。</p>
+    </div>
+    <p><a class="btn" href="index.html">← 返回首页</a></p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>WireGuard 管理台（WireGuardManager）· MIT License · <a href="https://github.com/leirui2/wireguard-manage">github.com/leirui2/wireguard-manage</a></p>
+    <p>本工具会直接修改远程服务器上的 WireGuard 配置。虽然内置备份与自动回滚，仍建议先在测试环境验证，并自行确保有其它方式登录服务器。请遵守所在地区法律法规，仅用于自己拥有或已获授权的服务器。</p>
+  </div>
+</footer>
+
+</body>
+</html>

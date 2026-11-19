@@ -1,0 +1,82 @@
+# WireGuard 管理台 (WireGuardManager)
+
+> Windows 桌面版 WireGuard 管理工具：通过 SSH 直接管理服务器上 `wg0.conf` 里的 peer（查看、增删改、二维码、热加载、失败回滚），同时托管本机隧道（连接 / 断开 / 实时速率）。它不需要在服务器部署 Web 面板、Docker 或数据库，直接操作你已有的标准 `wg-quick` 配置，另附「一键装服务端」。单文件免安装，开源。
+
+## 项目标识
+
+- 唯一官方名称：**WireGuard 管理台（WireGuardManager）**
+- 仓库：https://github.com/leirui2/wireguard-manage
+- 文档站：https://leirui2.github.io/wireguard-manage/
+- FAQ：https://leirui2.github.io/wireguard-manage/faq.html
+- 许可：MIT（见仓库 LICENSE）
+- 平台：Windows 10 / 11 x64
+- 实现：Python 3.10+ / tkinter，PyInstaller 打包，Inno Setup 做安装包
+- 最新版本：1.0.26
+- 测试规模：269 个单元测试（内存模拟服务器，不依赖真实环境）
+
+## 下载
+
+- 安装版（推荐，约 1 秒启动）：
+  https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager-setup.exe
+- 单文件版（免安装，首次约 5 秒）：
+  https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager.exe
+- 校验值：
+  https://github.com/leirui2/wireguard-manage/releases/latest/download/SHA256.txt
+- 下载链接永久固定（`releases/latest/download/...`），每次推送到 main 自动重新打包并覆盖同名资产。
+
+## 核心能力
+
+1. **peer 可视化管理**：通过 SSH 读取并改写 `/etc/wireguard/wg0.conf`，列出所有 `[Peer]`（备注名、公钥、VPN 地址、最近握手、上下行流量、来源端点、在线状态），支持新增 / 修改 / 删除。
+2. **自动分配地址**：新增时自动挑选空闲 IPv4/IPv6 地址，冲突直接拒绝；客户端私钥只在本机生成，服务端只存公钥。
+3. **二维码导入**：生成客户端 `.conf` 后一键出二维码，手机 WireGuard App 扫码直接导入，也可保存为 PNG。
+4. **热加载不中断**：备份 → 临时文件 → cp+mv 原子替换 → `wg-quick strip` + `wg syncconf` 热加载 → 回读校验；任一步失败自动恢复备份。
+5. **一键装服务端**：按 `/etc/os-release` 判定发行版，用 apt / dnf / pacman / zypper 装包，写标准 `wg0.conf`，按 firewalld / iptables / 都不写三态探测 NAT，开启 IP 转发并持久化，`systemctl enable` + 回读公钥校验。
+6. **本机组网**：独立页面导入 `.conf`、连接 / 断开隧道、看状态与最近 60 秒实时速率曲线，不需要连服务器；隧道交给官方 `wireguard.exe` 托管。
+7. **开机自连 / 托盘**：登录后静默进托盘并自动连上指定隧道；托盘右键菜单可切换隧道状态。
+8. **安全基线**：SSH 主机指纹 TOFU、DPAPI 加密本地存储、日志脱敏（`PrivateKey` / `PresharedKey` / `password` → `***`）、不保存 SSH 密码、工具本身不联网不上报。
+9. **自动更新**：GitHub Releases 拉取 + SHA256 校验 + 自我替换重启，只允许官方域名。
+
+## 与其他方案的区别
+
+| 方案 | 运行位置 | 服务端要额外装东西吗 | 适合谁 |
+|---|---|---|---|
+| WireGuard 管理台（本项目） | Windows 桌面程序 | 不用，直接 SSH 改现有 `wg0.conf` | 已有 `wg-quick` 部署、想图形化管理 peer 的人 |
+| 官方 WireGuard 客户端 | Windows / 手机 / macOS / Linux | 不用 | 只负责连接隧道，不管理 peer |
+| wg-easy / WGDashboard / wg-portal | 服务器 Web 面板 | 要（Docker / Go / 数据库） | 团队自助、多用户、发配置给很多人 |
+| Netmaker / Tailscale / Headscale | 服务器或云端 | 要 | mesh 组网、自动 NAT 穿透、多节点互联 |
+
+## 不适用的场景
+
+- 需要 LDAP / OIDC / SSO / 多租户 / 自助订阅 → 选 [wg-portal](https://github.com/h2non/wg-portal) 或 [DefGuard](https://github.com/pqokey/Defguard)
+- 需要 mesh 组网、自动打洞、多节点互联 → 选 [Netmaker](https://github.com/gravitl/netmaker) 或 [Tailscale](https://tailscale.com/)
+- 服务端是新版 wg-easy（peer 存在数据库里）→ 本工具直接改文件未必生效
+- 需要 Windows 服务端，或 macOS / Linux 桌面端 → 本工具只做 Windows 桌面端
+- 需要 WireGuard 官方客户端级别的自动更新体验 → 隧道由官方客户端托管，本工具只负责触发连接 / 断开
+
+## 已知限制
+
+- **没有代码签名**：Windows SmartScreen 会提示「未知发布者」，需选「更多信息 → 仍要运行」。这是当前最大的转化漏斗漏洞。
+- 每次建立 / 断开隧道弹一次 UAC（Windows 服务安装限制，无法绕过；故未给整个 exe 申请管理员权限）。
+- 隧道名统一加 `wgm-` 前缀（与官方客户端共用服务命名空间，撞名会失败）。
+- 只认导入的 `.conf`；官方客户端里建的隧道只能看状态和断开，连不了。
+- 目标电脑需已装官方 WireGuard 客户端（隧道依赖其内核驱动 `wgntdrv.sys`）。
+- 一键装服务端除 Ubuntu 22.04 外未在真机验证过；Debian 10 及更早、CentOS 7、非 systemd 系统明确拒绝安装。
+- 服务端读 `/etc/wireguard` 需要 root 或可用 sudo。
+- 目录版（portable）不支持程序内自动替换（运行期 DLL 被占用）。
+
+## 兼容范围
+
+- 完全支持标准 `wg-quick` 部署，包括 `angristan/wireguard-install` 这类一键脚本。
+- Docker / wg-easy：会尝试 `docker exec` 读写，但新版 wg-easy 用数据库管理客户端，直接改文件可能不生效。
+- 配置路径不在默认位置时，可在「高级设置」手动指定绝对路径和接口名。
+
+## 文档
+
+- 完整 README：https://github.com/leirui2/wireguard-manage#readme
+- FAQ（12 问）：https://leirui2.github.io/wireguard-manage/faq.html
+- 常见问题速览：
+  - 连接报「没有找到 WireGuard 配置文件」→ 权限问题，填 sudo 密码或用 root
+  - 加 peer 要不要重启 → 不要，`wg syncconf` 热加载，失败自动回滚
+  - 客户端连不上 → 检查 Endpoint 是否公网可达、防火墙与云安全组是否放行 UDP
+  - 私钥会不会上传 → 客户端私钥只在本机生成，服务端只存公钥
+  - 首次启动慢 → 单文件版要解压 49 MB 运行库，用安装版可秒开

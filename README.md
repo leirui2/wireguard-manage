@@ -1,21 +1,58 @@
-# WireGuard 管理台
+# WireGuard 管理台（WireGuardManager）
+
+> **WireGuard 管理台（WireGuardManager）是一个 Windows 桌面版 WireGuard 管理工具：通过 SSH 直接管理服务器上 `wg0.conf` 里的 peer（查看、增删改、二维码、热加载、失败回滚），同时托管本机隧道（连接 / 断开 / 实时速率）。它不需要在服务器部署 Web 面板、Docker 或数据库，直接操作你已有的标准 `wg-quick` 配置，另附「一键装服务端」。单文件免安装，开源。**
+
+[![Build](https://github.com/leirui2/wireguard-manage/actions/workflows/build.yml/badge.svg)](https://github.com/leirui2/wireguard-manage/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![平台](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D7.svg)]()
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)]()
+[![总下载](https://img.shields.io/github/downloads/leirui2/wireguard-manage/total.svg)](https://github.com/leirui2/wireguard-manage/releases)
+[![中文文档](https://img.shields.io/badge/docs-leirui2.github.io-2ea44f.svg)](https://leirui2.github.io/wireguard-manage/)
 
 一个 Windows 桌面工具，两件事合在一个程序里：**本机组网**（导入 conf、连接 / 断开隧道，不用另开 WireGuard 客户端）和**服务器密钥管理**（SSH 连上去可视化查看 / 新增 / 修改 / 删除客户端密钥，不用手敲 `wg`、`wg-quick`，也不用登上去编辑 `wg0.conf`）。
 
 ![界面截图](build_assets/exe_screenshot.png)
 
-[![Build](https://github.com/leirui2/wireguard-manage/actions/workflows/build.yml/badge.svg)](https://github.com/leirui2/wireguard-manage/actions/workflows/build.yml)
-
 ### ⬇️ 直接下载
 
 | 版本 | 下载 | 说明 |
 |---|---|---|
-| **最新构建** | **[WireGuardManager.exe](https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager.exe)** | 每次推送到 `main` 自动重新打包，链接永久不变 |
+| **安装版（推荐）** | **[WireGuardManager-setup.exe](https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager-setup.exe)** | 双击安装，开始菜单 + 桌面快捷方式，装完启动约 1 秒；卸载在「应用和功能」里 |
+| **单文件版（免安装）** | **[WireGuardManager.exe](https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager.exe)** | 丢到任意有写权限的目录双击即用，支持程序内自动更新；首次启动约 5 秒（要解压运行库） |
 
 SHA256 校验值见同一发行版下的 [SHA256.txt](https://github.com/leirui2/wireguard-manage/releases/latest/download/SHA256.txt)。
 
 > Windows 10 / 11 64 位，双击即用，**不需要安装 Python 或任何运行库**。
 > 也可以到 [Releases 页面](https://github.com/leirui2/wireguard-manage/releases) 查看历史版本。
+
+---
+
+## 它和其他 WireGuard 管理方案的区别
+
+| 方案 | 运行位置 | 服务端要额外装东西吗 | 适合谁 |
+|---|---|---|---|
+| **WireGuard 管理台（本项目）** | Windows 桌面程序 | **不用**，直接 SSH 改现有的 `wg0.conf` | 已有 `wg-quick` 部署、想图形化管理 peer 的人 |
+| 官方 WireGuard 客户端 | Windows / 手机 / macOS / Linux 客户端 | 不用 | 只负责**连接**隧道，不管理 peer |
+| wg-easy / WGDashboard / wg-portal | 服务器上的 Web 面板 | 要（Docker / Go / 数据库） | 团队自助、多用户、要给很多人发配置 |
+| Netmaker / Tailscale / Headscale | 服务器或云端 | 要 | mesh 组网、自动 NAT 穿透、跨多节点 |
+
+一句话差别：**本工具把「管理 WireGuard peer」这件事留在你的 Windows 电脑上，服务端保持标准 `wg-quick` 不变。**
+
+### 适合谁
+
+- 自己在 VPS 上手搓过 `wg0.conf`，现在要给同事/客户批量加 peer，不想手敲 `wg set` 和改 AllowedIPs
+- 已经有可用的 WireGuard 服务端，**不想再往里塞 Docker、数据库或 Web 面板**
+- 需要给客户端生成配置并**扫码**导入，不想在聊天工具里来回传 `.conf`
+- 想在 Windows 上把隧道连 / 断、实时看上下行速率，不想另外开官方客户端
+- 服务器上还没装 WireGuard，希望有个图形界面**一键装服务端**并顺手把 peer 管起来
+
+### 不适合谁（说清楚比吹嘘有用）
+
+- 需要 **LDAP / OIDC / SSO / 多租户 / 自助订阅** → 用 [wg-portal](https://github.com/h2non/wg-portal) 或 [DefGuard](https://github.com/pqokey/Defguard)
+- 需要 **mesh 组网、自动打洞、多节点互联** → 用 [Netmaker](https://github.com/gravitl/netmaker) 或 [Tailscale](https://tailscale.com/)
+- 服务端是 **wg-easy 新版**（peer 存在数据库里）→ 本工具直接改文件**未必生效**，建议仍用 wg-easy 自带界面
+- 需要 **Windows 服务端**或 **macOS / Linux 桌面端** → 本工具只做 Windows 桌面端
+- 需要 **WireGuard 官方客户端的自动更新** → 隧道由官方 `wireguard.exe` 托管，本工具只负责触发连接 / 断开
 
 ---
 
@@ -124,7 +161,7 @@ python main.py
 想让它带「同时安装 WireGuard 官方客户端」的勾选项，把
 `wireguard-amd64-<版本>.msi` 放进 `build_assets\` 即可 —— 会先校验 SHA256 与 Authenticode 签名，
 签发给 WireGuard LLC 才打进去。国内网络下官网常被 DNS 污染 / 直连被重置，
-`build_assets\fetch_wireguard_msi.py` 会自动依次试环境变量代理、系统代理、直连。
+`build_assets\fetch_wireguard_msi.py` 会自动依次尝试环境变量、系统网络配置，最后直连。
 
 打包环境是项目内的 `.build-venv\`，首次使用需先创建：
 
@@ -317,7 +354,7 @@ VPN 网段：  [10.9.0.0/24]    服务端会占 .1，客户端从这里分配
 
 - **密钥名称**（必填，例如 `张三-手机`）
 - 备注（选填，例如 `研发部 / 2026年入职领用`）
-- 客户端 `AllowedIPs`（默认 `0.0.0.0/0, ::/0`，即全局代理）
+- 客户端 `AllowedIPs`（默认 `0.0.0.0/0, ::/0`，即全部流量经隧道转发）
 - DNS（默认取自服务端配置）
 - Endpoint（默认 SSH 的 IP + 监听端口）
 - 指定 VPN 地址（留空 = 自动分配）
@@ -474,7 +511,7 @@ v1.0.11 · [检查更新]   发现新版本 v1.0.12                        [发�
 - **没有代码签名**：Windows 会提示「未知发布者」，更新后首次启动也可能被 SmartScreen 拦一次
 - **程序所在目录必须可写**：放在 `C:\Program Files` 会因权限不足替换失败（本来也不建议放那儿）
 - **替换过程程序会退出几秒**，由脚本覆盖文件并重新启动，期间不要强杀进程
-- **访问 GitHub 需要代理时**，检查更新会失败；此时点「发行版页面」手动下载
+- **网络环境无法访问 GitHub 时**，检查更新会失败；此时点「发行版页面」手动下载
 - 替换失败会在 `updates\update-error.txt` 留记号，下次启动会提示，**旧版本仍可正常使用**
 
 ### 组网功能的限制
@@ -502,15 +539,25 @@ wireguard-manage/
 │   ├── tunnel.py              # 本机组网隧道（托管官方 WireGuard 客户端）
 │   ├── downloads.py           # 官方客户端下载地址
 │   └── updater.py             # 检查更新、下载校验、自我替换
-├── tests/test_core.py         # 63 个单元测试（含模拟服务器）
-├── tests/test_tunnel.py       # 组网模块的纯逻辑测试（不碰真隧道）
+├── tests/                      # 269 个单元测试（内存模拟服务器，不碰真实环境）
 ├── build_assets/              # 图标、版本信息、界面截图、版本注入脚本
+├── docs/                      # GitHub Pages 站点：落地页、FAQ、llms.txt、robots.txt
 ├── wireguard-manager.spec     # PyInstaller 打包配置
 ├── requirements.txt           # 运行时依赖
 ├── 启动工具.bat                # 源码一键启动
 ├── 打包exe.bat                 # 一键打包 exe
 └── .github/workflows/build.yml # 推送到 GitHub 自动构建
 ```
+
+---
+
+## 在线文档
+
+| 页面 | 地址 | 内容 |
+|---|---|---|
+| 落地页 | <https://leirui2.github.io/wireguard-manage/> | 一页看懂：功能、下载、方案对比 |
+| 常见问题 | <https://leirui2.github.io/wireguard-manage/faq.html> | 12 个真实使用问题的自足答案 |
+| 给 AI 读的说明 | <https://leirui2.github.io/wireguard-manage/llms.txt> | 机器可读的项目简介与适用边界 |
 
 ---
 

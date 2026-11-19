@@ -92,9 +92,9 @@ def signature_ok(path: str) -> tuple[bool, str]:
 
 
 def proxy_candidates() -> list[str | None]:
-    """要试的代理，按可能性排序。
+    """要试的网络出口，按可能性排序。
 
-    这台机器的环境变量里有一个代理（可能没开），Windows 的"Internet 选项"里
+    这台机器的环境变量里可能配了一个出口（可能没开），Windows 的"Internet 选项"里
     还有一个（实际能用的往往是这个）。所以两边都试，最后再试直连。
     """
     found: list[str | None] = []
@@ -192,7 +192,7 @@ def main(argv: list[str]) -> int:
     print("[ERROR] 没拿到可用的安装包。")
     print("        国内网络常见原因：download.wireguard.com 被 DNS 污染 / 直连被重置。")
     print("        三个办法：")
-    print("          1) 开代理再跑一次（脚本会自动读系统代理和 HTTP(S)_PROXY 环境变量）")
+    print("          1) 检查网络设置后重跑一次（脚本会自动读环境变量与系统网络设置）")
     print("          2) 浏览器里手动下载 wireguard-amd64-<版本>.msi，放进 build_assets\\")
     print("          3) 有 VPN 的话先连上再跑")
     print("        没有这个文件也能打包，只是安装包里少了「同时安装客户端」选项。")

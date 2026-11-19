@@ -135,7 +135,7 @@ def fetch_latest(timeout: int = 10) -> Latest:
     except urllib.error.URLError as exc:
         raise UpdateError(f"连不上 GitHub：{exc.reason}") from exc
     except TimeoutError as exc:
-        raise UpdateError("连接 GitHub 超时，检查网络或代理") from exc
+        raise UpdateError("连接 GitHub 超时，检查网络设置") from exc
 
     try:
         data = json.loads(raw.decode("utf-8"))

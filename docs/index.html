@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WireGuard 管理台（WireGuardManager）— Windows 桌面版 WireGuard 管理工具</title>
+<meta name="description" content="Windows 桌面版 WireGuard 管理工具：通过 SSH 直接管理服务器上 wg0.conf 里的 peer（查看、增删改、二维码、热加载、失败回滚），同时托管本机隧道。不需要在服务器部署 Web 面板、Docker 或数据库，直接操作你已有的标准 wg-quick 配置。单文件免安装，开源。">
+<meta name="keywords" content="WireGuard, WireGuard 管理, WireGuard GUI, wg-quick, peer 管理, VPN 管理, Windows, SSH, wg0.conf">
+<link rel="canonical" href="https://leirui2.github.io/wireguard-manage/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="WireGuard 管理台">
+<meta property="og:title" content="WireGuard 管理台（WireGuardManager）— Windows 桌面版 WireGuard 管理工具">
+<meta property="og:description" content="通过 SSH 直接管理服务器 wg0.conf 里的 peer，同时托管本机隧道。不需要在服务器部署 Web 面板、Docker 或数据库。">
+<meta property="og:url" content="https://leirui2.github.io/wireguard-manage/">
+<meta property="og:image" content="https://leirui2.github.io/wireguard-manage/assets/main-ui.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/favicon.ico" type="image/x-icon">
+<link rel="apple-touch-icon" href="assets/icon.png">
+<style>
+:root{--fg:#1b1f24;--muted:#57606a;--bg:#fff;--soft:#f6f8fa;--line:#d0d7de;--blue:#0969da;--green:#1a7f37;--amber:#9a6700;--red:#cf222e}
+*{box-sizing:border-box}
+body{margin:0;font:16px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;color:var(--fg);background:var(--bg)}
+.wrap{max-width:980px;margin:0 auto;padding:0 20px}
+header{padding:44px 0 30px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#f6f8fa,#fff)}
+h1{margin:0 0 10px;font-size:34px;line-height:1.25;letter-spacing:-.02em}
+.sub{color:var(--muted);font-size:18px;margin:0 0 20px}
+.badges{display:flex;flex-wrap:wrap;gap:8px}
+.badges a,.badges span{display:inline-block;font-size:12px;padding:3px 9px;border:1px solid var(--line);border-radius:20px;color:var(--muted);text-decoration:none;background:#fff}
+.badges a:hover{border-color:var(--blue);color:var(--blue)}
+section{padding:34px 0;border-bottom:1px solid var(--line)}
+h2{font-size:24px;margin:0 0 16px;letter-spacing:-.01em}
+h3{font-size:17px;margin:26px 0 8px}
+p{margin:0 0 14px}
+a{color:var(--blue)}
+code{background:var(--soft);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:13.5px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+pre{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow:auto}
+pre code{background:none;border:0;padding:0}
+table{width:100%;border-collapse:collapse;margin:0 0 16px;font-size:14.5px}
+th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+th{background:var(--soft);font-weight:600}
+tbody tr:nth-child(2n){background:#fbfcfd}
+.btn{display:inline-block;padding:11px 20px;border-radius:8px;text-decoration:none;font-weight:600;font-size:15px;margin:0 8px 10px 0;border:1px solid var(--line);background:#fff;color:var(--fg)}
+.btn.primary{background:var(--green);border-color:var(--green);color:#fff}
+.btn.primary:hover{background:#116329}
+.btn.blue{background:var(--blue);border-color:var(--blue);color:#fff}
+.btn.blue:hover{background:#0757ba}
+.card{border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:0 0 16px;background:#fff}
+.card h3{margin-top:0}
+.note{border-left:4px solid var(--amber);background:#fff8c5;padding:12px 16px;margin:0 0 16px;border-radius:0 6px 6px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+ul{padding-left:22px}
+li{margin:5px 0}
+.shot{width:100%;border:1px solid var(--line);border-radius:8px;background:#fff}
+figcaption{color:var(--muted);font-size:13.5px;margin-top:8px}
+figure{margin:0 0 20px}
+.kv{display:grid;grid-template-columns:150px 1fr;gap:6px 14px;font-size:15px}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0}
+footer{padding:28px 0 46px;color:var(--muted);font-size:14px}
+.ok{color:var(--green);font-weight:600}
+.no{color:var(--red);font-weight:600}
+@media(max-width:640px){h1{font-size:27px}.kv{grid-template-columns:1fr}}
+</style>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "name": "WireGuard 管理台 (WireGuardManager)",
+      "alternateName": ["WireGuardManager", "WireGuard 管理台"],
+      "applicationCategory": "NetworkApplication",
+      "applicationSubCategory": "VPN 管理工具",
+      "operatingSystem": "Windows 10, Windows 11",
+      "softwareVersion": "1.0.26",
+      "url": "https://github.com/leirui2/wireguard-manage",
+      "downloadUrl": "https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager-setup.exe",
+      "installUrl": "https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager-setup.exe",
+      "license": "https://opensource.org/licenses/MIT",
+      "author": { "@type": "Person", "name": "leirui2" },
+      "inLanguage": "zh-CN",
+      "isAccessibleForFree": true,
+      "description": "Windows 桌面版 WireGuard 管理工具：通过 SSH 直接管理服务器上 wg0.conf 里的 peer（查看、增删改、二维码、热加载、失败回滚），同时托管本机隧道（连接 / 断开 / 实时速率）。它不需要在服务器部署 Web 面板、Docker 或数据库，直接操作你已有的标准 wg-quick 配置，另附「一键装服务端」。单文件免安装，开源。",
+      "featureList": [
+        "SSH 可视化增删改 wg0.conf 里的 peer",
+        "新增 peer 自动分配空闲 IPv4/IPv6 地址",
+        "客户端配置一键生成二维码，手机 App 扫码导入",
+        "wg syncconf 热加载，不中断现有连接，失败自动回滚",
+        "一键装服务端（apt/dnf/pacman/zypper，按 /etc/os-release 判定）",
+        "本机组网页：导入 conf、连接/断开隧道、60 秒实时速率曲线",
+        "SSH 主机指纹 TOFU 校验，私钥只在本机生成",
+        "DPAPI 加密本地存储，口令与 conf 不明文落盘",
+        "SHA256 校验的自动更新",
+        "单文件免安装 exe 或 Inno Setup 安装包"
+      ],
+      "softwareRequirements": "Windows 10/11 x64；目标服务器需已安装 WireGuard（可用内置一键安装）或标准 wg-quick 部署",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "CNY" }
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Windows 上有没有 WireGuard 图形化管理工具，能批量给服务器加 peer？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "有。WireGuard 管理台（WireGuardManager）是一个 Windows 桌面版 WireGuard 管理工具，通过 SSH 直接管理服务器上 wg0.conf 里的 peer，支持查看、新增、修改、删除，地址冲突自动检查，新建的客户端配置可出二维码供手机 WireGuard App 扫码导入。它不需要在服务器部署 Web 面板、Docker 或数据库，直接操作你已有的标准 wg-quick 配置。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "不想在服务器装 wg-easy 或 Docker，有没有直接改 wg0.conf 的工具？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "有。WireGuard 管理台（WireGuardManager）就是这种工具：它是一个 Windows 桌面程序，用 SSH 连上服务器，直接读写 /etc/wireguard/wg0.conf，服务器上不需要装任何 Web 面板、Docker、数据库或额外守护进程，服务端保持标准 wg-quick 部署不变。注意：新版 wg-easy 把 peer 存在数据库里，这种情况下本工具直接改文件未必生效。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "用 WireGuard 管理台加 peer 需要重启服务或断线吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不需要。工具采用备份 → 临时文件 → cp+mv 原子替换 → wg-quick strip + wg syncconf 热加载 → 回读校验的流程，不中断现有连接。热加载失败时会自动恢复备份并重新加载，不会留下半截配置。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "WireGuard 管理台安全吗？客户端私钥会上传吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "客户端私钥只在你本机生成，服务端只保存公钥，私钥从不离开本机。SSH 密码与配置用 Windows DPAPI 加密存储，known_hosts 采用 TOFU 方式记录主机指纹防止中间人，日志中的 PrivateKey/PresharedKey/password 一律脱敏为 ***。工具本身不联网、不上报任何数据。"
+          }
+        }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>WireGuard 管理台（WireGuardManager）</h1>
+    <p class="sub">Windows 桌面版 WireGuard 管理工具 —— 通过 SSH 直接管理服务器上 <code>wg0.conf</code> 里的 peer，同时托管本机隧道。不需要在服务器部署 Web 面板、Docker 或数据库。</p>
+    <div class="badges">
+      <a href="https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager-setup.exe">⬇ 安装版（推荐，约 1 秒启动）</a>
+      <a href="https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager.exe">⬇ 单文件版（免安装）</a>
+      <span>Windows 10 / 11 x64</span>
+      <span>MIT License</span>
+      <span>Python 3.10+ / tkinter</span>
+      <span>269 个单元测试</span>
+    </div>
+    <div class="badges" style="margin-top:10px">
+      <a href="https://github.com/leirui2/wireguard-manage">源码仓库</a>
+      <a href="faq.html">常见问题</a>
+      <a href="llms.txt">llms.txt</a>
+      <a href="https://github.com/leirui2/wireguard-manage/releases">历史版本</a>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>它是什么</h2>
+    <p><strong>WireGuard 管理台（WireGuardManager）是一个 Windows 桌面版 WireGuard 管理工具：通过 SSH 直接管理服务器上 <code>wg0.conf</code> 里的 peer（查看、增删改、二维码、热加载、失败回滚），同时托管本机隧道（连接 / 断开 / 实时速率）。它不需要在服务器部署 Web 面板、Docker 或数据库，直接操作你已有的标准 <code>wg-quick</code> 配置，另附「一键装服务端」。单文件免安装，开源。</strong></p>
+    <figure>
+      <img class="shot" src="assets/main-ui.png" alt="WireGuard 管理台主界面：连接服务器、探测结果、密钥列表、操作日志四个区域" width="1185" height="892" loading="lazy">
+      <figcaption>主界面：连接服务器 → 探测部署结果 → 密钥列表（公钥 / VPN 地址 / 最近握手 / 流量 / 状态）→ 操作日志</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>它和其他 WireGuard 管理方案的区别</h2>
+    <table>
+      <thead><tr><th>方案</th><th>运行位置</th><th>服务端要额外装东西吗</th><th>适合谁</th></tr></thead>
+      <tbody>
+        <tr><td><strong>WireGuard 管理台（本项目）</strong></td><td>Windows 桌面程序</td><td><span class="ok">不用</span>，直接 SSH 改现有的 <code>wg0.conf</code></td><td>已有 <code>wg-quick</code> 部署、想图形化管理 peer 的人</td></tr>
+        <tr><td>官方 WireGuard 客户端</td><td>Windows / 手机 / macOS / Linux</td><td><span class="ok">不用</span></td><td>只负责<strong>连接</strong>隧道，不管理 peer</td></tr>
+        <tr><td>wg-easy / WGDashboard / wg-portal</td><td>服务器上的 Web 面板</td><td><span class="no">要</span>（Docker / Go / 数据库）</td><td>团队自助、多用户、要发配置给很多人</td></tr>
+        <tr><td>Netmaker / Tailscale / Headscale</td><td>服务器或云端</td><td><span class="no">要</span></td><td>mesh 组网、自动 NAT 穿透、多节点互联</td></tr>
+      </tbody>
+    </table>
+    <p>一句话差别：<strong>本工具把「管理 WireGuard peer」这件事留在你的 Windows 电脑上，服务端保持标准 <code>wg-quick</code> 不变。</strong></p>
+
+    <div class="grid">
+      <div class="card">
+        <h3>适合</h3>
+        <ul>
+          <li>已有可用的 WireGuard 服务端，<strong>不想再塞 Docker、数据库或 Web 面板</strong></li>
+          <li>要给同事 / 客户批量加 peer，不想手敲 <code>wg set</code> 和改 AllowedIPs</li>
+          <li>要扫码发配置，不想在聊天工具里来回传 <code>.conf</code></li>
+          <li>想在 Windows 上一键连 / 断隧道、实时看速率</li>
+          <li>服务器还没装 WireGuard，想图形界面一键装</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>不适合</h3>
+        <ul>
+          <li>需要 LDAP / OIDC / SSO / 多租户 → <a href="https://github.com/h2non/wg-portal">wg-portal</a> / <a href="https://github.com/pqokey/Defguard">DefGuard</a></li>
+          <li>需要 mesh 组网、自动打洞 → <a href="https://github.com/gravitl/netmaker">Netmaker</a> / <a href="https://tailscale.com/">Tailscale</a></li>
+          <li>服务端是新版 wg-easy（peer 存数据库）→ 改文件未必生效</li>
+          <li>需要 Windows 服务端 / macOS / Linux 桌面端 → 本工具只做 Windows</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>核心能力</h2>
+    <table>
+      <thead><tr><th>能力</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>查看密钥</td><td>自动列出所有 <code>[Peer]</code>，显示备注名、公钥、VPN 地址、最近握手、上下行流量、来源端点、在线状态</td></tr>
+        <tr><td>新增密钥</td><td>自动分配空闲 IPv4/IPv6 地址 → 生成密钥对 → 写入 <code>[Peer]</code> → 热加载 → 生成客户端 <code>.conf</code></td></tr>
+        <tr><td>扫码导入</td><td>生成密钥后一键出二维码，手机 WireGuard App 直接扫，也可存成 PNG</td></tr>
+        <tr><td>热加载不中断</td><td><code>wg syncconf</code> 热加载，已有连接不断；任一步失败自动回滚到备份</td></tr>
+        <tr><td>一键装服务端</td><td>按 <code>/etc/os-release</code> 判定发行版，apt / dnf / pacman / zypper 自动选命令，装完直接可用</td></tr>
+        <tr><td>本机组网</td><td>独立页面导入 conf、连接 / 断开、看状态和 60 秒实时速率曲线，<strong>不需要连服务器</strong></td></tr>
+        <tr><td>安全基线</td><td>SSH 主机指纹 TOFU、私钥只在本机生成、DPAPI 加密、日志脱敏、SSH 密码不落盘</td></tr>
+        <tr><td>自动更新</td><td>GitHub Releases 拉取 + SHA256 校验 + 自我替换重启，只允许官方域名</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>加 peer 的三步</h2>
+    <pre><code>1. 填服务器 IP / SSH 端口 / 用户名 → 点「连接」，工具自动探测 wg0.conf、监听端口、VPN 网段
+2. 点「新增密钥」→ 自动分配地址、生成密钥对、写入配置、热加载 → 弹出二维码
+3. 手机 WireGuard App「扫描二维码」导入，完事</code></pre>
+    <figure>
+      <img class="shot" src="assets/qr-dialog.png" alt="客户端配置二维码对话框，可保存为 PNG" width="497" height="613" loading="lazy" style="max-width:420px">
+      <figcaption>客户端配置二维码：手机 App 扫一下就导入，码里含客户端私钥，别乱传</figcaption>
+    </figure>
+    <div class="note">注意：二维码里的客户端私钥是凭据本身，扫完别把它贴到公开的地方。</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>服务器还没装 WireGuard？</h2>
+    <p>连上去发现是「裸机」时，工具不会只丢一句「没找到配置文件」，而是弹出安装方案：选网段、选端口、选出口网卡、要不要写 NAT 规则，确认后自动装包、建配置、开转发、起服务，装完自动重新探测并进入管理界面。</p>
+    <figure>
+      <img class="shot" src="assets/install-dialog.png" alt="一键安装服务端对话框，显示将要执行的命令清单" width="618" height="610" loading="lazy" style="max-width:520px">
+      <figcaption>一键安装服务端：执行前先把每条命令列出来给你看</figcaption>
+    </figure>
+    <p>支持 Ubuntu / Debian / Mint / Kali / Deepin / UOS / Armbian / 树莓派 OS、RHEL 9 / Rocky / Alma / CentOS Stream / Fedora、RHEL 8 系（走 EPEL + ELRepo）、Arch / Manjaro / openSUSE。<strong>Debian 10 及更早、CentOS 7、Alpine 等非 systemd 系统会明确拒绝安装</strong>，并逐条给出手动命令。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>安全设计</h2>
+    <pre><code>备份 wg0.conf
+   ↓
+写临时文件（umask 077）
+   ↓
+cp + mv 原子替换（不会出现半截文件）
+   ↓
+wg-quick strip + wg syncconf 热加载（不中断现有连接）
+   ↓
+回读文件校验 + 运行时公钥核对
+   ↓
+任何一步失败 → 自动恢复备份并重新加载</code></pre>
+    <dl class="kv">
+      <dt>私钥归属</dt><dd>客户端私钥只在本机生成，服务端只存公钥；私钥不出现在命令行，临时文件权限 600</dd>
+      <dt>本地存储</dt><dd><code>connections.json</code> / <code>tunnels.json</code> 用 Windows DPAPI 加密，不明文落盘</dd>
+      <dt>主机指纹</dt><dd>SSH 指纹 TOFU 记录到 <code>known_hosts</code>，指纹变化直接拒绝连接</dd>
+      <dt>日志脱敏</dt><dd><code>PrivateKey</code> / <code>PresharedKey</code> / <code>password</code> 一律替换为 <code>***</code></dd>
+      <dt>网络行为</dt><dd>工具不联网、不上报数据，只在你点「连接」时通过 SSH 直连你的服务器</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>下载</h2>
+    <p>
+      <a class="btn primary" href="https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager-setup.exe">⬇ 安装版 WireGuardManager-setup.exe</a>
+      <a class="btn blue" href="https://github.com/leirui2/wireguard-manage/releases/latest/download/WireGuardManager.exe">⬇ 单文件版 WireGuardManager.exe</a>
+    </p>
+    <p>两种发行版功能完全相同，下载链接永久固定（<code>releases/latest/download/...</code>）。安装版装完启动约 1 秒；单文件版首次启动约 5 秒（要把 49 MB 运行库解压到 <code>%TEMP%</code>），换来的是免安装和程序内自动更新。</p>
+    <p>校验值：<a href="https://github.com/leirui2/wireguard-manage/releases/latest/download/SHA256.txt">SHA256.txt</a>（与 exe 同目录）。</p>
+    <div class="note"><strong>没有代码签名</strong>：Windows SmartScreen 会提示「未知发布者」，选「更多信息 → 仍要运行」。这是本项目当前最大的已知限制。</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>更多</h2>
+    <ul>
+      <li><a href="faq.html">常见问题（12 问）</a> —— 连接失败、客户端连不上、wg-easy 兼容、杀软误报、首次启动慢等</li>
+      <li><a href="https://github.com/leirui2/wireguard-manage#readme">完整 README</a> —— 功能特性、兼容矩阵、使用说明、目录结构</li>
+      <li><a href="https://github.com/leirui2/wireguard-manage/releases">历史版本与 SHA256</a></li>
+      <li><a href="https://github.com/leirui2/wireguard-manage/issues">问题反馈</a></li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>WireGuard 管理台（WireGuardManager）· MIT License · <a href="https://github.com/leirui2/wireguard-manage">github.com/leirui2/wireguard-manage</a></p>
+    <p>本工具会直接修改远程服务器上的 WireGuard 配置。虽然内置备份与自动回滚，仍建议先在测试环境验证，并自行确保有其它方式登录服务器。请遵守所在地区法律法规，仅用于自己拥有或已获授权的服务器。</p>
+  </div>
+</footer>
+
+</body>
+</html>

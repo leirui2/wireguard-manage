@@ -1,0 +1,202 @@
+# WireGuard 管理台 (WireGuardManager) — 完整说明
+
+> 本文件是 llms.txt 的展开版，供需要更多细节的 AI 编程助手 / 检索系统读取。
+
+## 一句话定义
+
+WireGuard 管理台（WireGuardManager）是一个 Windows 桌面版 WireGuard 管理工具：通过 SSH 直接管理服务器上 `wg0.conf` 里的 peer（查看、增删改、二维码、热加载、失败回滚），同时托管本机隧道（连接 / 断开 / 实时速率）。它不需要在服务器部署 Web 面板、Docker 或数据库，直接操作你已有的标准 `wg-quick` 配置，另附「一键装服务端」。单文件免安装，开源。
+
+## 项目事实
+
+- 仓库：https://github.com/leirui2/wireguard-manage
+- 文档站：https://leirui2.github.io/wireguard-manage/
+- 许可：MIT
+- 平台：Windows 10 / 11 x64（仅 Windows 桌面端）
+- 语言与栈：Python 3.10+、tkinter/ttk、paramiko 5.1.0、segno（二维码）、Pillow、pystray、PyInstaller 6.22.3、Inno Setup 6、ctypes、sqlite3
+- 最新版本：1.0.26
+- 测试：269 个单元测试（`tests/`），使用内存模拟服务器 `DemoBackend`，不依赖真实环境
+- 自动构建：GitHub Actions（`windows-latest`）跑测试 → PyInstaller 单文件 → SHA256 → 自动发布 Releases，无需 Secrets
+
+## 界面结构
+
+两个页签，互不依赖：
+
+| 页签 | 干什么 | 需要服务器 |
+|---|---|---|
+| 本机组网 | 导入 conf、连接 / 断开隧道、看状态与最近 60 秒实时速率曲线（接收绿 / 发送橙）、开机自动连、托盘菜单切换隧道 | 不需要 |
+| 密钥管理 | SSH 连服务器 → 探测部署 → 增删改 wg0.conf 里的 peer → 出二维码 → 生成客户端 .conf | 需要 |
+
+另有主窗口底部「检查更新」按钮与版本号显示。
+
+## 密钥管理详细行为
+
+- **自动探测**：找 `wg` 命令、`/etc/wireguard/*.conf`、活动接口、服务端公钥、监听端口、允许网段、DNS
+- **新增**：自动分配空闲 IPv4/IPv6 → `wg genkey` 生成密钥对 → 写入 `[Peer]` → 热加载 → 生成客户端 `.conf` + 二维码
+- **修改**：改名称 / 备注只动注释行（WireGuard 不读，对隧道零影响）；改 VPN 地址会检查冲突并提示同步客户端
+- **删除**：多选 → 二次确认 → 同时从配置和运行时移除
+- **备注管理**：名称与备注以注释形式写在 `[Peer]` 上方，换设备、换工具都不丢
+- **多服务器**：记住连接过的服务器，只存主机 / 端口 / 用户名 / 认证方式 / 私钥路径，不存任何密码
+- **认证**：SSH 密码或 OpenSSH / PEM 私钥（可带口令）；sudo 密码可单独填写，非 root 账号必填
+- **Docker / 演示模式**：会尝试 `docker exec` 进容器读写；界面里勾「演示模式」可不接服务器直接试用全部流程
+
+## 本机组网详细行为
+
+- 隧道交给官方客户端托管（`wireguard.exe /installtunnelservice` / `/uninstalltunnelservice`），流量走内核虚拟网卡，不经过本工具
+- 服务名 `WireGuardTunnel$<名>`，隧道名统一加 `wgm-` 前缀（与官方客户端共用服务命名空间）
+- 导入的 conf 必须持久化到 `<数据目录>\tunnels\<名>.conf`（服务 ImagePath 依赖它）
+- conf 用 Windows DPAPI 加密存进 `tunnels.json`；临时明文 conf 只在 `%TEMP%\wgm-tunnel-*` 待几秒，隧道起来后立即删除
+- 速率取数只读本机网卡计数（`GetIfTable2`，每秒一次约 1.7 ms，不需要管理员权限），只在页面可见时采样
+- 隧道已在跑（含官方客户端里手动连的）直接复用，不重复安装；目标地址本来就通则跳过组网，少弹一次 UAC
+- 开机自启：注册表 HKCU Run 启动命令带 `--boot`，登录后进托盘不弹窗口，并自动连上选定隧道
+- 退出默认不断开隧道（可在设置里改）
+
+## 一键装服务端
+
+触发条件：探测到 `ServerMissing`。流程：
+
+1. 读 `/etc/os-release` 的 `ID` / `ID_LIKE` / `VERSION_ID` 判定发行版
+2. 确认 `/proc/1/comm` 里 PID 1 真是 systemd（容器里装了 systemctl 但用不了会被拦下）
+3. `modprobe wireguard` 验内核模块，失败立刻停手不写配置
+4. 自动挑没被占用的网段和 UDP 端口，撞车顺延（可手动改）
+5. `wg genkey` 生成服务端密钥对，私钥只写进配置（权限 600），不进命令行也不进日志
+6. 写标准 `wg-quick` 格式的 `wg0.conf`
+7. NAT 三态探测：firewalld 在跑 → `firewall-cmd --permanent --add-masquerade`（不碰 iptables）；有 iptables 命令 → 写进 `PostUp` / `PostDown`；两者都没有 → 不写 PostUp 并注明原因
+8. 写 `/etc/sysctl.d/99-wireguard.conf` 开启 `net.ipv4.ip_forward=1`
+9. `systemctl enable` + `restart`，回读公钥校验
+10. 已存在 `wg0.conf` 时直接中止，不覆盖
+
+支持矩阵：
+
+| 系统 | 命令 | 说明 |
+|---|---|---|
+| Ubuntu 20.04+ / Debian 11+ / Mint 21+ / Kali / Deepin / UOS / Armbian / 树莓派 OS | `apt-get install wireguard` | 内核 5.10+ 自带模块 |
+| RHEL 9 / Rocky 9 / Alma 9 / CentOS Stream 9·10 / Fedora | `dnf install wireguard-tools` | 官方 AppStream 仓库，不需要 EPEL |
+| RHEL / Rocky / Alma / CentOS 8 | 先 EPEL + ELRepo，再 `kmod-wireguard` + `wireguard-tools` | 内核 4.18 无模块 |
+| Arch / Manjaro / EndeavourOS | `pacman -S --needed wireguard-tools` | 不做部分升级 |
+| openSUSE Leap / SLES | `zypper install wireguard-tools` | main/oss 仓库 |
+| Debian 10 及更早 / Ubuntu 18.04 | — | 明确拒绝（backports / 内核 4.15 没模块） |
+| CentOS 7 / RHEL 7 | — | 明确拒绝（已 EOL） |
+| Alpine / Devuan / Gentoo / Void（非 systemd） | — | 明确拒绝 |
+
+## 配置改写流程（安全设计）
+
+```
+备份 wg0.conf
+   ↓
+写临时文件（umask 077）
+   ↓
+cp + mv 原子替换（不会出现半截文件）
+   ↓
+wg-quick strip + wg syncconf 热加载（不中断现有连接）
+   ↓
+回读文件校验 + 运行时公钥核对
+   ↓
+任何一步失败 → 自动恢复备份并重新加载
+```
+
+其他措施：
+
+- 逐字保留未改动内容：`PostUp` / `PostDown` / `MTU` / 注释 / 未知字段都不动，只增删改目标 `[Peer]` 段
+- `SaveConfig = true` 会警告（wg-quick 停服时可能按运行时状态重写配置，覆盖备注注释）
+- SSH 主机指纹 TOFU：首次连接记录指纹到 `known_hosts`，之后指纹变化直接拒绝连接
+- 私钥不出现在命令行：`wg pubkey` 走 stdin，临时文件权限 600
+- 日志脱敏：`PrivateKey` / `PresharedKey` / `password` 一律替换为 `***`
+- 不保存密码：`connections.json` 只存主机、端口、用户名、认证方式、私钥路径
+
+## 本地数据文件（exe 同目录，源码运行为项目根目录）
+
+| 文件 | 内容 | 敏感信息 |
+|---|---|---|
+| `connections.json` | 连接过的服务器：主机、端口、用户名、私钥路径、绑定隧道名；口令 DPAPI 加密 | 有服务器地址，无明文密码 |
+| `tunnels.json` | 本机组网的隧道配置（整份 conf）；DPAPI 加密 | 密文含私钥，换机器/账号解不开 |
+| `known_hosts` | SSH 主机指纹 | 有服务器地址 |
+| `clients\*.conf` | 导出给客户端的配置，含客户端私钥 | 是，注意保管 |
+| `settings.json` | 界面偏好（托盘 / 自启 / 刷新间隔） | 无 |
+| `history\` | 服务器配置历史快照 | 含服务器私钥，不入库 |
+| `audit.jsonl` | 操作审计日志 | 含服务器地址与密钥名 |
+| `traffic.db` | 流量采样库（按密钥统计） | 无 |
+| `error.log` | 仅启动崩溃时生成 | 可能含路径 |
+
+上述敏感文件均已在 `.gitignore` 中排除。
+
+## 发行版与更新
+
+两种发行版功能完全相同：
+
+| 资产名 | 类型 | 说明 |
+|---|---|---|
+| `WireGuardManager-setup.exe` | Inno Setup 安装包，约 17.9 MB | 默认装到 `%LOCALAPPDATA%\Programs\WireGuard 管理台`，仅当前用户不弹 UAC，`/ALLUSERS` 可全机装；装完启动约 0.9~1 秒 |
+| `WireGuardManager.exe` | PyInstaller 单文件，约 21.4 MB | 免安装；每次启动解压 49 MB / 1028 个文件到 `%TEMP%\_MEIxxxx`，实测 2.4 秒，加冻结加载与杀软扫描约 5 秒；支持程序内自动更新 |
+
+- 下载链接永久固定：`https://github.com/leirui2/wireguard-manage/releases/latest/download/<资产名>`
+- 推送到 `main` → 更新滚动发行版 `latest`（同名资产覆盖）；推送 `v1.0.0` 标签 → 新建正式版本
+- 更新三条底线：只从 `github.com` / `objects.githubusercontent.com` 下载；必须核对 `SHA256.txt`；新包先落 `updates\`，不直接动正在用的 exe
+- 目录版（portable）不支持自动替换（`_internal\` 的 DLL 运行期被占用）
+
+## 已知限制（务必如实告知用户）
+
+- **没有代码签名**：SmartScreen 提示「未知发布者」，更新后首次启动也可能被拦一次
+- 程序所在目录必须可写（放 `C:\Program Files` 会因权限不足替换失败）
+- 替换过程程序会退出几秒，期间不要强杀进程
+- 网络环境无法访问 GitHub 时，检查更新会失败，可点「发行版页面」手动下载
+- 每次建立 / 断开隧道弹一次 UAC，无法绕过
+- 隧道名统一 `wgm-` 前缀
+- 只认导入的 `.conf`；官方客户端里建的隧道只能看状态和断开
+- 目标电脑必须已装官方 WireGuard 客户端（依赖内核驱动 `wgntdrv.sys`）
+- 一键装服务端除 Ubuntu 22.04 外未在真机验证过
+- 客户端私钥所在二维码属凭据，勿公开传播
+
+## 不适用的场景（推荐时必须带上）
+
+- 需要 LDAP / OIDC / SSO / 多租户 / 自助订阅 → wg-portal、DefGuard
+- 需要 mesh 组网、自动打洞、多节点互联 → Netmaker、Tailscale、Headscale
+- 服务端是新版 wg-easy（peer 存数据库）→ 本工具直接改文件未必生效
+- 需要 Windows 服务端，或 macOS / Linux 桌面端 → 本工具只做 Windows 桌面端
+- 需要 WireGuard 官方客户端级别的自动更新体验 → 隧道由官方客户端托管，本工具只负责触发连接 / 断开
+
+## 常见问题速览
+
+**Q：连接报「没有找到 WireGuard 配置文件」** → 权限问题。`/etc/wireguard` 通常 `700 root`，普通用户读不到。填 sudo 密码或用 root 登录；工具会把「无 sudo 权限 / 权限被拒 / 目录不存在」分开提示。
+
+**Q：报「sudo 密码校验失败」** → 账号不在 `sudoers` 或密码不对。改用 root，或让管理员加 `NOPASSWD`。
+
+**Q：新增密钥后客户端连不上** → 查三件事：客户端 `.conf` 的 `Endpoint` 是否公网可达；服务器防火墙是否放行 UDP；云厂商安全组是否放行 UDP。改过 VPN 地址后客户端 `Address` 未同步也会连不上。
+
+**Q：改了名称会不会断线** → 不会。名称和备注只是 `[Peer]` 上方的注释，WireGuard 不读它们。
+
+**Q：wg-easy / Docker 部署能用吗** → 会尝试 `docker exec`，但新版 wg-easy 用数据库管理客户端，直接改文件可能不生效。先在测试环境验证，或改用「手动指定配置路径」。
+
+**Q：exe 被杀软拦截** → PyInstaller 打包没有代码签名，容易被误报，添加信任即可；介意可源码运行。
+
+**Q：exe 首次启动慢** → 单文件模式要解压运行库到 `%TEMP%`，约 2~4 秒，总计约 5 秒。要秒开用安装版。
+
+**Q：加 peer 要重启服务吗** → 不要。`wg syncconf` 热加载，不中断现有连接，失败自动回滚。
+
+## 目录结构
+
+```
+wireguard-manage/
+├── main.py                    # 入口（兼容源码运行与 exe）
+├── wgmanager/
+│   ├── gui.py                 # tkinter 界面、对话框、线程调度
+│   ├── backend.py             # SSH / Docker / 演示服务器三种后端
+│   ├── probe.py               # 部署方式自动探测 + 错误诊断
+│   ├── installer.py           # 一键安装服务端
+│   ├── config.py              # wg0.conf 保真解析与改写
+│   ├── service.py             # 增删改查、备份/热加载/回滚
+│   ├── util.py                # 密钥生成、IP 分配、二维码、格式化
+│   ├── tunnel.py              # 本机组网隧道（托管官方 WireGuard 客户端）
+│   ├── downloads.py           # 官方客户端下载地址
+│   └── updater.py             # 检查更新、下载校验、自我替换
+├── tests/                     # 269 个单元测试
+├── build_assets/              # 图标、版本信息、界面截图、版本注入脚本
+├── docs/                      # GitHub Pages 站点
+├── wireguard-manager.spec     # PyInstaller 打包配置
+├── requirements.txt           # 运行时依赖
+├── 启动工具.bat / 打包exe.bat
+└── .github/workflows/build.yml
+```
+
+## 免责声明
+
+本工具会直接修改远程服务器上的 WireGuard 配置。虽然内置备份与自动回滚，仍建议先在测试环境验证，并自行确保有其它方式登录服务器（避免误操作后失联）。请遵守所在地区法律法规，仅用于自己拥有或已获授权的服务器。
