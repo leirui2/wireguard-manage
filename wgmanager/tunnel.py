@@ -42,6 +42,10 @@ _SC_MANAGER_CONNECT = 0x0001
 _SERVICE_QUERY_STATUS = 0x0004
 _ERROR_SERVICE_DOES_NOT_EXIST = 1060
 
+#: 卸载时等多久。原来只给 12 秒：服务处于 START_PENDING 时先要停下
+#: （最多 30 秒），再删注册项，12 秒根本不够，于是"明明已经断了"也报失败。
+DOWN_WAIT = 30
+
 
 class TunnelError(RuntimeError):
     """隧道没建成 / 卸载没生效。message 是给用户直接看的，别写英文报错码。"""
@@ -337,6 +341,31 @@ def service_state(name: str) -> str:
         return "unknown"
 
 
+def is_marked_for_delete(name: str) -> bool:
+    """服务注册项是不是"已被标记删除、只等系统回收"。
+
+    ``DeleteService`` 不是立即生效的：它只是把注册项打上 ``DeleteFlag=1``，
+    等所有打开过这个服务的句柄都关掉，SCM 才真正删。只要还有人（驱动、
+    残留进程、其它程序）握着句柄，``sc query`` 里就一直看得到这条服务，
+    再调一次卸载只会拿到 ``ERROR_SERVICE_MARKED_FOR_DELETE``(1072)。
+
+    这种时候隧道**其实已经断了**（网卡没了、wireguard 进程也没了），
+    界面不该再报"卸载没有生效"——用户会觉得软件坏了。读注册表比调
+    OpenService 可靠：不需要提权，也不会被 1072 的权限语义绕晕。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+
+        path = r"SYSTEM\CurrentControlSet\Services" + "\\" + service_name(
+            normalize_name(name))
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+            return int(winreg.QueryValueEx(key, "DeleteFlag")[0]) == 1
+    except (OSError, ValueError):
+        return False
+
+
 STATE_CN = {
     "running": "运行中",
     "stopped": "已停止",
@@ -623,6 +652,13 @@ def _remove_stale(name: str, exe: str, log=print) -> None:
     state = service_state(name)
     if state not in ("pending", "stopped"):
         return
+    if state == "stopped" and is_marked_for_delete(name):
+        # 上次卸载只把注册项标了删除，SCM 还没真正回收，再调一次卸载也只会
+        # 拿到 1072。这时候装新隧道必然失败，不如直接说清楚要重启。
+        raise TunnelError(
+            f"隧道 {name} 上一次没退干净：服务注册项 {service_name(name)} 已被"
+            f"标记删除，系统要等重启才会清掉它。\n\n"
+            f"重启一次电脑就能正常连接；重启之前这条隧道装不上。")
     log(f"隧道 {name} 上次没退干净（当前：{STATE_CN.get(state, state)}），"
         f"先把残留服务清掉再重建…")
     _launch(exe, ["/uninstalltunnelservice", name], log)
@@ -661,26 +697,52 @@ def install(name: str, conf_text: str, log=print) -> str:
     return path
 
 
-def down(name: str, log=print) -> str:
-    """卸载隧道服务。已经在跑的话会弹一次 UAC。"""
+def down(name: str, log=print, wait: float = None) -> str:
+    """卸载隧道服务。已经在跑的话会弹一次 UAC。
+
+    ``wait`` 只给测试用（默认 ``DOWN_WAIT`` 秒），生产调用不要传。
+    """
     name = normalize_name(name)
-    if service_state(name) == "absent":
+    state = service_state(name)
+    if state == "absent":
         return f"隧道 {name} 本来就没在运行"
     exe = client_path()
     if not exe:
         raise TunnelError("找不到 wireguard.exe，没法卸载隧道。")
     out = _launch(exe, ["/uninstalltunnelservice", name], log)
-    deadline = time.monotonic() + 12
-    while time.monotonic() < deadline:
-        if service_state(name) == "absent":
+    deadline = time.monotonic() + (DOWN_WAIT if wait is None else max(0.2, wait))
+    noted = time.monotonic()
+    while True:
+        state = service_state(name)
+        if state == "absent":
             # 服务没了，磁盘上那份明文 conf 也就没人读了，一并清掉。
             # 下次连的时候 GUI 会从 tunnels.json 里的密文重新解出来写。
             _cleanup(conf_path(name))
             log(f"组网隧道 {name} 已断开")
             return f"已断开组网隧道 {name}"
+        # 服务已经停下，只剩一条"待删除"的注册项：这不是失败。
+        # 隧道事实上已经断开了（网卡消失、wireguard 进程退出），注册项要等
+        # 系统回收句柄或者下次重启才会消失。
+        if state == "stopped" and is_marked_for_delete(name):
+            _cleanup(conf_path(name))
+            log(f"组网隧道 {name} 已断开（注册项待系统回收）")
+            return (f"已断开组网隧道 {name}\n\n"
+                    f"隧道已经真的断了。服务注册项 {service_name(name)} 已被"
+                    f"标记删除，等系统回收句柄或下次重启后自动消失，不影响使用。")
+        if time.monotonic() >= deadline:
+            break
+        if time.monotonic() - noted > 5:
+            noted = time.monotonic()
+            log(f"等待隧道服务卸载…（当前：{STATE_CN.get(state, state)}）")
         time.sleep(0.5)
-    detail = ("（" + " ".join(out.split())[:200] + "）") if out else ""
-    raise TunnelError(f"卸载隧道 {name} 没有生效{detail}")
+
+    detail = ("\n\nwireguard.exe 说：" + " ".join(out.split())[:200]) if out else ""
+    raise TunnelError(
+        f"卸载隧道 {name} 没有生效（服务仍处于「{STATE_CN.get(state, state)}」）。"
+        f"{detail}\n\n"
+        f"手动收尾：以管理员身份打开「服务」，找到 {service_name(name)}，"
+        f"停止并删除它；或者直接重启一次电脑。"
+    )
 
 
 def drop_conf(name: str) -> None:

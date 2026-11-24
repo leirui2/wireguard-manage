@@ -120,6 +120,79 @@ class TestStateHelpers(unittest.TestCase):
             tunnel.start("wgm-x", "   ", wait=1, log=lambda _m: None)
 
 
+class TestDownHandlesZombieService(unittest.TestCase):
+    """服务被标记删除（DeleteFlag=1）时，隧道其实已经断了，不能报失败。
+
+    2026-11-24 现场：开机自启连隧道，上一次卸载只把注册项标了删除，
+    SCM 没回收；用户点断开，12 秒里等不到 absent，界面弹"卸载隧道
+    xxx 没有生效"——可网卡、wireguard 进程早就没了。用户以为软件坏了。
+    """
+
+    def setUp(self):
+        self._saved = {
+            "service_state": tunnel.service_state,
+            "is_marked_for_delete": tunnel.is_marked_for_delete,
+            "client_path": tunnel.client_path,
+            "_launch": tunnel._launch,
+            "_cleanup": tunnel._cleanup,
+            "conf_path": tunnel.conf_path,
+        }
+        self.launched = []
+        self.cleaned = []
+        tunnel.client_path = lambda: r"C:\Program Files\WireGuard\wireguard.exe"
+        tunnel._launch = lambda exe, args, log=print: (
+            self.launched.append(list(args)), "")[1]
+        tunnel.conf_path = lambda name: f"<conf>\\{name}.conf"
+        tunnel._cleanup = lambda path: self.cleaned.append(path)
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(tunnel, key, value)
+
+    def test_zombie_service_counts_as_disconnected(self):
+        tunnel.service_state = lambda name: "stopped"
+        tunnel.is_marked_for_delete = lambda name: True
+
+        msg = tunnel.down("wgm-18-rl", log=lambda _m: None, wait=0.3)
+
+        self.assertIn("已断开组网隧道 wgm-18-rl", msg)
+        self.assertIn("重启", msg)               # 要告诉用户残骸怎么消
+        self.assertEqual(self.launched, [["/uninstalltunnelservice", "wgm-18-rl"]])
+        # 关键：conf 必须被清掉，不能因为"报错"把明文留在磁盘上
+        self.assertEqual(self.cleaned, ["<conf>\\wgm-18-rl.conf"])
+
+    def test_still_running_is_a_real_failure(self):
+        tunnel.service_state = lambda name: "running"
+        tunnel.is_marked_for_delete = lambda name: False
+
+        with self.assertRaises(tunnel.TunnelError) as ctx:
+            tunnel.down("wgm-18-rl", log=lambda _m: None, wait=0.3)
+        self.assertIn("没有生效", str(ctx.exception))
+        self.assertEqual(self.cleaned, [])
+
+    def test_absent_returns_early_without_uac(self):
+        tunnel.service_state = lambda name: "absent"
+        tunnel.is_marked_for_delete = lambda name: False
+
+        msg = tunnel.down("wgm-18-rl", log=lambda _m: None, wait=0.3)
+        self.assertIn("本来就没在运行", msg)
+        self.assertEqual(self.launched, [])
+
+    def test_restale_refuses_zombie_instead_of_waiting_20s(self):
+        tunnel.service_state = lambda name: "stopped"
+        tunnel.is_marked_for_delete = lambda name: True
+        exe = r"C:\Program Files\WireGuard\wireguard.exe"
+
+        with self.assertRaises(tunnel.TunnelError) as ctx:
+            tunnel._remove_stale("wgm-18-rl", exe, log=lambda _m: None)
+        self.assertIn("重启", str(ctx.exception))
+        self.assertEqual(self.launched, [])      # 别再白调一次卸载
+
+    def test_marked_for_delete_of_missing_service_is_false(self):
+        self.assertFalse(tunnel.is_marked_for_delete(
+            "wgm-definitely-not-a-tunnel-xyz"))
+
+
 class TestTunnelStore(unittest.TestCase):
     """隧道仓库：conf 必须加密落盘，名字撞了不能互相覆盖。"""
 
