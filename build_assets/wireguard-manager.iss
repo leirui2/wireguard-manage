@@ -32,6 +32,10 @@
 #define MyAppExeName "WireGuard管理台.exe"
 #define MyAppGuid "9C1D4E7A-3B62-4F18-9A5E-2D7C8B14F603"
 #define MyAppId "{{" + MyAppGuid + "}"
+; 客户端勾选项的描述文案：必须无条件定义。
+; 之前放在 [Tasks] 的 #if HasWGMSI == "1" 里，CI 上没带 msi（HasWGMSI=0）时
+; 这个 #define 被跳过，[Code] 里的 '{#WgTaskDesc}' 就成了未声明标识符，编译失败。
+#define WgTaskDesc "同时安装 WireGuard 官方客户端（组网功能必需，约 3 MB）"
 
 [Setup]
 AppId={#MyAppId}
@@ -91,7 +95,6 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："
 #if HasWGMSI == "1"
-#define WgTaskDesc "同时安装 WireGuard 官方客户端（组网功能必需，约 3 MB）"
 Name: "wgclient"; Description: "{#WgTaskDesc}"; \
     GroupDescription: "附加任务："; Flags: unchecked
 #endif
