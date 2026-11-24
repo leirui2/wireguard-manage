@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -189,7 +190,9 @@ def main(argv: list[str]) -> int:
             os.replace(dest, keep)
             print(f"       旧文件已改名为 {os.path.basename(keep)}，确认无用后可删")
 
-        tmpdir = tempfile.mkdtemp(prefix="wgm-msi-")
+        # 临时目录必须和 build_assets 同一块盘：CI 上 %TEMP% 在 C:，仓库在 D:，
+        # os.replace 跨盘会报 WinError 17，MSI 就被扔在半路，安装包跟着少一项。
+        tmpdir = tempfile.mkdtemp(prefix="wgm-msi-", dir=BUILD)
         probe = os.path.join(tmpdir, name)
         if not download(target, probe):
             continue
@@ -199,7 +202,7 @@ def main(argv: list[str]) -> int:
             print(f"[WARN] 校验没过，丢弃（{detail}）")
             os.remove(probe)
             continue
-        os.replace(probe, dest)
+        shutil.move(probe, dest)
         print(f"[OK] {name}  {os.path.getsize(dest) / 1048576:.1f} MB")
         print(f"     {detail}")
         return 0
