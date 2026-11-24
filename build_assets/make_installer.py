@@ -141,7 +141,15 @@ def main(argv: list[str]) -> int:
 
     msi = find_msi()
     if msi:
-        ok, detail = msi_signature(msi)
+        # 先用哈希锁定判（fetch_wireguard_msi 里那张官方 SHA256 表），对得上就不看签名：
+        # CI 的 runner 上 Get-AuthenticodeSignature 拿不到证书链，只按签名判会把好文件扔掉。
+        ok, detail = False, ""
+        try:
+            from fetch_wireguard_msi import verify as verify_msi
+            ok, detail = verify_msi(msi)
+        except Exception as exc:                     # noqa: BLE001 - 退回签名校验
+            print(f"[WARN] 哈希校验不可用，改按签名判（{exc}）")
+            ok, detail = msi_signature(msi)
         if ok:
             defines.append("/DHasWGMSI=1")
             defines.append(f"/DWGMsiPath={msi}")
