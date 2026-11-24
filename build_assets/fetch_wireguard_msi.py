@@ -32,6 +32,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build_assets")
 BASE = "https://download.wireguard.com/windows-client/wireguard-amd64-{}.msi"
 
+# 官方站之外再挂镜像：GitHub Actions 的 runner 上 download.wireguard.com 一次都没
+# 下通过（七个版本全超时），所以 CI 出的安装包一直缺「同时安装客户端」那一项。
+# 镜像就是本仓库 vendor 发行版里那份官方原文件，签名与哈希都照旧校验，来源无所谓。
+MIRRORS = [
+    "https://github.com/leirui2/wireguard-manage/releases/download/vendor/wireguard-amd64-{}.msi",
+]
+
 # 从新到旧试；新版本发布后在这里补一行即可
 CANDIDATES = ["1.1.1", "1.1", "1.0.1", "1.0", "0.6.1", "0.6", "0.5.3"]
 
@@ -156,7 +163,14 @@ def main(argv: list[str]) -> int:
     elif argv and not argv[0].startswith("-"):
         versions = [argv[0]]
 
-    targets = [url] if url else [BASE.format(v) for v in versions]
+    if url:
+        targets = [url]
+    else:
+        targets = []
+        for v in versions:
+            targets.append(BASE.format(v))
+            for m in MIRRORS:
+                targets.append(m.format(v))
     for target in targets:
         name = os.path.basename(target) or "wireguard-amd64.msi"
         if not name.endswith(".msi"):
