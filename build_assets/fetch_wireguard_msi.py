@@ -70,11 +70,13 @@ def verify(path: str) -> tuple[bool, str]:
         got = sha256_of(path)
         if got != expect:
             return False, f"SHA256 对不上官方值\n  实际 {got}\n  官方 {expect}"
+        # 哈希已锁死就不再看签名了：CI 的 runner 上 Get-AuthenticodeSignature 拿不到
+        # 证书链（输出为空），按签名判会把这个文件白扔，安装包于是缺了客户端选项。
+        return True, f"SHA256 与官方一致（{got[:16]}…），跳过签名检查"
     ok, detail = signature_ok(path)
     if not ok:
         return False, detail
-    tail = "，SHA256 与官方一致" if expect else "（该版本无官方哈希可比对）"
-    return True, detail + tail
+    return True, detail + "（该版本无官方哈希可比对）"
 
 
 def signature_ok(path: str) -> tuple[bool, str]:

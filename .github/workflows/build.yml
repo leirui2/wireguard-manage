@@ -3,7 +3,7 @@ name: Build Windows EXE
 on:
   push:
     branches: [main, master]
-    tags: ["v*"]
+    tags: ["v[0-9]*"]
   workflow_dispatch:
 
 # GITHUB_TOKEN 默认只有读权限，创建 Release 需要显式申请写权限
@@ -59,7 +59,7 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          if ($env:GITHUB_REF -like "refs/tags/v*") {
+          if ($env:GITHUB_REF -match '^refs/tags/v\d') {
             $ver = $env:GITHUB_REF_NAME.TrimStart("v")
           } else {
             $line = Select-String -Path wgmanager/__init__.py -Pattern '__version__\s*=\s*"([\d.]+)"'
